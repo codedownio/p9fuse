@@ -1,0 +1,42 @@
+[package]
+name = "p9fuse"
+version = "0.1.0"
+edition = "2021"
+description = "Mount a remote 9p2000.L filesystem locally over FUSE, unprivileged."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["plan9", "fuse", "filesystem", "ninep", "mount"]
+categories = ["filesystem", "network-programming"]
+# TODO(before publish): set to the public repo URL.
+# repository = "https://github.com/OWNER/p9fuse"
+
+[[bin]]
+name = "p9fuse"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+# codec = BytesCodec, used to expose raw TCP/Unix sockets as byte-chunk sinks/streams (see transport.rs).
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+futures-util = "0.3"
+nix = { version = "0.29", features = ["mount", "socket", "user"] }
+# Only needed for the (optional) websocket transport; TCP/Unix builds don't touch it.
+tokio-tungstenite = "0.24"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# default-features=false drops the libfuse C linkage: fuser mounts by exec'ing the setuid
+# `fusermount3` helper instead, which keeps this a pure-Rust build (no C buildInputs in the nix
+# derivation) AND is exactly what lets an unprivileged process mount without CAP_SYS_ADMIN.
+# abi-7-31 (without libfuse) enables the modern FUSE opcodes we rely on -- READDIRPLUS (7.21) and
+# the WRITEBACK_CACHE cap (7.23); the default min ABI (7.8) compiles those dispatches out.
+fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
