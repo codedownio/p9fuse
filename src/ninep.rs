@@ -159,13 +159,16 @@ impl<'a> R<'a> {
         self.take(1).map(|s| s[0])
     }
     pub fn u16(&mut self) -> Option<u16> {
-        self.take(2).map(|s| u16::from_le_bytes(s.try_into().unwrap()))
+        self.take(2)
+            .map(|s| u16::from_le_bytes(s.try_into().unwrap()))
     }
     pub fn u32(&mut self) -> Option<u32> {
-        self.take(4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
+        self.take(4)
+            .map(|s| u32::from_le_bytes(s.try_into().unwrap()))
     }
     pub fn u64(&mut self) -> Option<u64> {
-        self.take(8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+        self.take(8)
+            .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
     }
     pub fn str(&mut self) -> Option<String> {
         let n = self.u16()? as usize;
@@ -219,11 +222,7 @@ pub fn parse_getattr(body: &[u8]) -> Option<Attr> {
 pub fn parse_readdir(data: &[u8]) -> Vec<DirEntry> {
     let mut r = R::new(data);
     let mut out = Vec::new();
-    loop {
-        let qid = match r.qid() {
-            Some(q) => q,
-            None => break,
-        };
+    while let Some(qid) = r.qid() {
         let (offset, typ, name) = match (r.u64(), r.u8(), r.str()) {
             (Some(o), Some(t), Some(n)) => (o, t, n),
             _ => break,

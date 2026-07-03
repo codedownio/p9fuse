@@ -103,6 +103,8 @@ struct Diod {
 }
 
 impl Diod {
+    // The child is reaped in `Drop` (kill + wait); clippy can't see through the struct.
+    #[allow(clippy::zombie_processes)]
     fn start() -> Diod {
         let diod = find_diod().expect("diod (checked by skip_reason)");
         let export = tempfile::tempdir().unwrap();
@@ -128,7 +130,11 @@ impl Diod {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                return Diod { child, export, port };
+                return Diod {
+                    child,
+                    export,
+                    port,
+                };
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -248,12 +254,19 @@ async fn posix_semantics() {
 
         // 4. chmod: set an unusual mode and read it back (full POSIX-mode fidelity over 9p).
         std::fs::set_permissions(mp.join("w.txt"), std::fs::Permissions::from_mode(0o640)).unwrap();
-        let mode = std::fs::metadata(mp.join("w.txt")).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(mp.join("w.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o640, "chmod did not round-trip through 9p");
 
         // 5. symlink + readlink.
         std::os::unix::fs::symlink("w.txt", mp.join("link")).unwrap();
-        assert_eq!(std::fs::read_link(mp.join("link")).unwrap(), Path::new("w.txt"));
+        assert_eq!(
+            std::fs::read_link(mp.join("link")).unwrap(),
+            Path::new("w.txt")
+        );
         // Following the symlink reads the target's contents.
         assert_eq!(std::fs::read(mp.join("link")).unwrap(), b"written via 9p");
 
@@ -268,7 +281,10 @@ async fn posix_semantics() {
             "rename not reflected in directory listing: {listing:?}"
         );
         assert!(!mp.join("w.txt").exists());
-        assert_eq!(std::fs::read(mp.join("renamed.txt")).unwrap(), b"written via 9p");
+        assert_eq!(
+            std::fs::read(mp.join("renamed.txt")).unwrap(),
+            b"written via 9p"
+        );
 
         // 7. unlink + rmdir.
         std::fs::remove_file(mp.join("renamed.txt")).unwrap();

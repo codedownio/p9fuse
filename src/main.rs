@@ -9,7 +9,10 @@ use p9fuse::{fuse9p, mount9p};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
-#[command(name = "p9fuse", about = "Mount a remote 9p2000.L server over TCP/Unix/websocket")]
+#[command(
+    name = "p9fuse",
+    about = "Mount a remote 9p2000.L server over TCP/Unix/websocket"
+)]
 struct Args {
     #[command(subcommand)]
     cmd: Cmd,
@@ -91,20 +94,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     match Args::parse().cmd {
-        Cmd::Mount9p { connect, headers, msize, mountpoint } => {
+        Cmd::Mount9p {
+            connect,
+            headers,
+            msize,
+            mountpoint,
+        } => {
             let transport = build_transport(&connect, &parse_headers(&headers)?).await?;
             mount9p::mount9p(transport, &mountpoint, msize).await
         }
         Cmd::Mount9pFuse {
-            connect, headers, msize, uid, aname,
-            attr_ttl, entry_ttl, negative_ttl, readdirplus, writeback, wb_depth,
+            connect,
+            headers,
+            msize,
+            uid,
+            aname,
+            attr_ttl,
+            entry_ttl,
+            negative_ttl,
+            readdirplus,
+            writeback,
+            wb_depth,
             mountpoint,
         } => {
             let transport = build_transport(&connect, &parse_headers(&headers)?).await?;
             let tuning = fuse9p::Tuning {
                 attr_ttl: std::time::Duration::from_secs(attr_ttl),
                 entry_ttl: std::time::Duration::from_secs(entry_ttl),
-                negative_ttl: (negative_ttl > 0).then(|| std::time::Duration::from_secs(negative_ttl)),
+                negative_ttl: (negative_ttl > 0)
+                    .then(|| std::time::Duration::from_secs(negative_ttl)),
                 readdirplus,
                 writeback,
                 wb_depth,
@@ -124,7 +142,9 @@ async fn build_transport(
     } else if let Some(path) = connect.strip_prefix("unix://") {
         Ok(Box::new(UnixTransport::connect(Path::new(path)).await?))
     } else if connect.starts_with("ws://") || connect.starts_with("wss://") {
-        Ok(Box::new(WebSocketTransport::connect(connect, headers).await?))
+        Ok(Box::new(
+            WebSocketTransport::connect(connect, headers).await?,
+        ))
     } else {
         Err(format!(
             "unsupported --connect {connect:?}: use tcp://host:port, unix:///path, or ws://.../wss://..."

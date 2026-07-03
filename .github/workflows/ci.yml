@@ -1,36 +1,32 @@
 name: CI
 
+# All tools (Rust toolchain, rustfmt, clippy, diod, fuse3) come from the Nix flake -- no apt, no
+# rustup. `nix flake check` runs fmt + clippy + build reproducibly; the FUSE integration tests run
+# under `nix develop` because they need /dev/fuse (unavailable in the Nix build sandbox).
+
 on:
   push:
     branches: [main]
   pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
+  workflow_dispatch:
 
 jobs:
-  check:
-    name: fmt + clippy + build
+  ci:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --all-targets
 
-  test:
-    name: integration tests (diod + FUSE)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # diod (a 9p2000.L server) + fuse3 are what the tests/diod_fuse.rs suite mounts against.
-      # The suite skips gracefully if they're missing, but CI installs them so it runs for real.
-      - name: Install diod + fuse3
-        run: sudo apt-get update && sudo apt-get install -y diod fuse3
-      - run: cargo test --all-targets
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+
+      # Build + clippy (-D warnings) + rustfmt, all defined as flake checks.
+      - name: nix flake check
+        run: nix flake check -L
+
+      # Integration tests mount a real diod export over FUSE, so they need /dev/fuse and a *setuid*
+      # `fusermount3` (unprivileged FUSE). On a Nix/NixOS runner that's /run/wrappers/bin -- put it
+      # ahead of the dev shell's non-setuid fusermount3 (set inside `nix develop`, since nix
+      # re-prepends its own bins). The suite skips gracefully if the runner has no usable FUSE.
+      - name: integration tests (diod + FUSE)
+        run: nix develop -c bash -c 'export PATH="/run/wrappers/bin:$PATH"; cargo test'

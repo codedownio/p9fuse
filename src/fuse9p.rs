@@ -224,7 +224,9 @@ fn time_or_now(t: TimeOrNow) -> (u64, u64) {
             (d.as_secs(), d.subsec_nanos() as u64)
         }
         TimeOrNow::Now => {
-            let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            let d = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
             (d.as_secs(), d.subsec_nanos() as u64)
         }
     }
@@ -285,7 +287,13 @@ impl Fuse9p {
         let (client, root_qid) = NineClient::connect(transport, msize, uid, aname).await?;
 
         let mut inodes = HashMap::new();
-        inodes.insert(ROOT_INO, Inode { fid: client.root_fid, lookups: 1 });
+        inodes.insert(
+            ROOT_INO,
+            Inode {
+                fid: client.root_fid,
+                lookups: 1,
+            },
+        );
 
         // Kept for the invalidation task (resolves server-pushed paths -> inodes via fresh walks).
         let inval_client = client.clone();
@@ -324,7 +332,12 @@ impl Fuse9p {
         let mut session = fuser::Session::new(fs, &mp, &options)?;
         let notifier = session.notifier();
         // Read invalidation paths (one per line) from stdin and drop them from the kernel cache.
-        tokio::spawn(invalidation_loop(notifier, inval_client, root_fid, root_qid_path));
+        tokio::spawn(invalidation_loop(
+            notifier,
+            inval_client,
+            root_fid,
+            root_qid_path,
+        ));
         // session.run() blocks for the life of the mount; run it off the async executor so the
         // runtime stays free to service the client's (and invalidation task's) requests.
         tokio::task::spawn_blocking(move || session.run())
@@ -453,7 +466,13 @@ impl Filesystem for Fuse9p {
                     let c = self.client.clone();
                     let _ = self.rt.block_on(async move { c.clunk(newfid).await });
                 } else {
-                    self.inodes.insert(ino, Inode { fid: newfid, lookups: 1 });
+                    self.inodes.insert(
+                        ino,
+                        Inode {
+                            fid: newfid,
+                            lookups: 1,
+                        },
+                    );
                 }
                 reply.entry(&self.tuning.entry_ttl, &to_fileattr(ino, &attr), 0);
             }
@@ -606,7 +625,10 @@ impl Filesystem for Fuse9p {
         };
         let client = self.client.clone();
         let cap = size.min(self.client.msize.saturating_sub(24));
-        match self.rt.block_on(async move { client.read(fid, offset as u64, cap).await }) {
+        match self
+            .rt
+            .block_on(async move { client.read(fid, offset as u64, cap).await })
+        {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(e),
         }
@@ -643,9 +665,9 @@ impl Filesystem for Fuse9p {
             Some(wb) => wb,
             // Read-only handle being written (shouldn't happen): fall back to a synchronous write.
             None => {
-                let res = self.rt.block_on(async move {
-                    write_all(&client, fid, off, &data, chunk).await
-                });
+                let res = self
+                    .rt
+                    .block_on(async move { write_all(&client, fid, off, &data, chunk).await });
                 return match res {
                     Ok(()) => reply.written(len),
                     Err(e) => reply.error(e),
@@ -655,7 +677,12 @@ impl Filesystem for Fuse9p {
 
         self.rt.block_on(async {
             // Backpressure: block here once wb_depth writes are already in flight.
-            let permit = wb.sem.clone().acquire_owned().await.expect("write-back semaphore closed");
+            let permit = wb
+                .sem
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("write-back semaphore closed");
             let wb2 = wb.clone();
             tokio::spawn(async move {
                 let _permit = permit; // released (slot freed) when this write finishes
@@ -683,7 +710,7 @@ impl Filesystem for Fuse9p {
         if let Some(h) = self.handles.remove(&fh) {
             // Finish any deferred writes before clunking the fid (and surface a write error here if
             // the app never called fsync/flush).
-            let err = h.wb.map(|wb| self.drain_writeback(wb)).flatten();
+            let err = h.wb.and_then(|wb| self.drain_writeback(wb));
             let fid = h.fid;
             let c = self.client.clone();
             let _ = self.rt.block_on(async move { c.clunk(fid).await });
@@ -732,7 +759,10 @@ impl Filesystem for Fuse9p {
             None => return reply.error(libc::EBADF),
         };
         let client = self.client.clone();
-        let entries = match self.rt.block_on(async move { client.readdir(fid, offset as u64, 8192).await }) {
+        let entries = match self
+            .rt
+            .block_on(async move { client.readdir(fid, offset as u64, 8192).await })
+        {
             Ok(e) => e,
             Err(e) => return reply.error(e),
         };
@@ -769,7 +799,10 @@ impl Filesystem for Fuse9p {
             None => return reply.error(libc::ENOENT),
         };
         let client = self.client.clone();
-        let entries = match self.rt.block_on(async move { client.readdir(fid, offset as u64, 8192).await }) {
+        let entries = match self
+            .rt
+            .block_on(async move { client.readdir(fid, offset as u64, 8192).await })
+        {
             Ok(e) => e,
             Err(e) => return reply.error(e),
         };
@@ -822,7 +855,14 @@ impl Filesystem for Fuse9p {
             let fa = to_fileattr(child_ino, &attr);
             // add() returns true when the entry did NOT fit -- so only commit the lookup reference
             // (bump count / keep the fid) when it WAS accepted, else clunk and stop.
-            if reply.add(child_ino, e.offset as i64, &e.name, &self.tuning.entry_ttl, &fa, 0) {
+            if reply.add(
+                child_ino,
+                e.offset as i64,
+                &e.name,
+                &self.tuning.entry_ttl,
+                &fa,
+                0,
+            ) {
                 full = true;
                 let c = self.client.clone();
                 let _ = self.rt.block_on(async move { c.clunk(nf).await });
@@ -831,7 +871,13 @@ impl Filesystem for Fuse9p {
                 let c = self.client.clone();
                 let _ = self.rt.block_on(async move { c.clunk(nf).await }); // dup of an existing fid
             } else {
-                self.inodes.insert(child_ino, Inode { fid: nf, lookups: 1 });
+                self.inodes.insert(
+                    child_ino,
+                    Inode {
+                        fid: nf,
+                        lookups: 1,
+                    },
+                );
             }
         }
         reply.ok();
@@ -869,7 +915,9 @@ impl Filesystem for Fuse9p {
         let res = self.rt.block_on(async move {
             // Clone the parent into openfid and create+open the new file through it.
             client.walk(parent_fid, openfid, &[]).await?;
-            client.lcreate(openfid, &name, oflags, mode & 0o7777, gid).await?;
+            client
+                .lcreate(openfid, &name, oflags, mode & 0o7777, gid)
+                .await?;
             // Separately walk a base fid to the new entry for the inode table + attrs.
             client.walk(parent_fid, basefid, &[&name]).await?;
             let a = client.getattr(basefid).await?;
@@ -878,14 +926,20 @@ impl Filesystem for Fuse9p {
         match res {
             Ok(attr) => {
                 let ino = self.intern(attr.qid.path);
-                self.inodes.insert(ino, Inode { fid: basefid, lookups: 1 });
+                self.inodes.insert(
+                    ino,
+                    Inode {
+                        fid: basefid,
+                        lookups: 1,
+                    },
+                );
                 // The created file is opened for writing -> give it a write-back tracker.
                 let fh = self.insert_handle(openfid, true);
                 reply.created(&self.tuning.entry_ttl, &to_fileattr(ino, &attr), 0, fh, 0);
             }
             Err(e) => {
                 let c = self.client.clone();
-                let _ = self.rt.block_on(async move {
+                self.rt.block_on(async move {
                     let _ = c.clunk(openfid).await;
                     let _ = c.clunk(basefid).await;
                 });
@@ -920,7 +974,13 @@ impl Filesystem for Fuse9p {
         match res {
             Ok(attr) => {
                 let ino = self.intern(attr.qid.path);
-                self.inodes.insert(ino, Inode { fid: basefid, lookups: 1 });
+                self.inodes.insert(
+                    ino,
+                    Inode {
+                        fid: basefid,
+                        lookups: 1,
+                    },
+                );
                 reply.entry(&self.tuning.entry_ttl, &to_fileattr(ino, &attr), 0);
             }
             Err(e) => {
@@ -1054,7 +1114,13 @@ impl Filesystem for Fuse9p {
         match res {
             Ok(attr) => {
                 let ino = self.intern(attr.qid.path);
-                self.inodes.insert(ino, Inode { fid: basefid, lookups: 1 });
+                self.inodes.insert(
+                    ino,
+                    Inode {
+                        fid: basefid,
+                        lookups: 1,
+                    },
+                );
                 reply.entry(&self.tuning.entry_ttl, &to_fileattr(ino, &attr), 0);
             }
             Err(e) => {
@@ -1097,7 +1163,10 @@ impl Fuse9p {
         };
         let name = name.to_string_lossy().to_string();
         let client = self.client.clone();
-        match self.rt.block_on(async move { client.unlinkat(parent_fid, &name, flags).await }) {
+        match self
+            .rt
+            .block_on(async move { client.unlinkat(parent_fid, &name, flags).await })
+        {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }

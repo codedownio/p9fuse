@@ -35,7 +35,7 @@ pub struct NineClient {
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 impl NineClient {
@@ -192,7 +192,9 @@ impl NineClient {
             .req(TATTACH, RATTACH, &w.buf)
             .await
             .map_err(|e| to_io(format!("Tattach failed: errno {e}")))?;
-        R::new(&body).qid().ok_or_else(|| to_io("short Rattach").into())
+        R::new(&body)
+            .qid()
+            .ok_or_else(|| to_io("short Rattach").into())
     }
 
     /// Walk `names` from `fid` into the fresh `newfid`. `names` empty clones the fid (newfid points

@@ -33,7 +33,7 @@ pub trait NineTransport: Send + 'static {
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 /// Wrap a raw byte-stream socket (TCP or Unix) as a `(ByteSink, ByteStream)` pair. `BytesCodec`

@@ -22,7 +22,7 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 /// Split `transport`, mount the v9fs client at `mountpoint`, and bridge bytes until either side
@@ -36,8 +36,12 @@ pub async fn mount9p(
     let (mut sink, mut stream) = transport.split();
 
     // 2. socketpair: sock_kernel is handed to the v9fs client; sock_bridge is our pump end.
-    let (sock_kernel, sock_bridge) =
-        socketpair(AddressFamily::Unix, SockType::Stream, None, SockFlag::empty())?;
+    let (sock_kernel, sock_bridge) = socketpair(
+        AddressFamily::Unix,
+        SockType::Stream,
+        None,
+        SockFlag::empty(),
+    )?;
 
     // 3. Turn the bridge end into a tokio stream. We must start pumping BEFORE mount(2) returns:
     // the kernel performs the 9p version/attach handshake synchronously inside mount(), so if the
