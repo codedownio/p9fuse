@@ -10,7 +10,10 @@
 //! `diod` is run rootless in TCP-listen mode with `-n` (no auth) and `-N` (no userdb), and the
 //! client attaches as the current uid, so `setfsuid` is a no-op and no privilege is required.
 
-use p9fuse::{mount, NineClient, TcpTransport, Tuning};
+use futures_util::{SinkExt, StreamExt};
+use p9fuse::{
+    mount, NineClient, NineTransport, TcpTransport, Tuning, UnixTransport, WebSocketTransport,
+};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -168,10 +171,116 @@ fn umount(mp: &Path) {
     let _ = Command::new("umount").arg(mp).status();
 }
 
-/// Start diod, FUSE-mount its export with `tuning`, wait until the mount is live, run `body` (on a
-/// blocking thread, with the mountpoint path), then unmount and tear everything down. Any panic in
-/// `body` propagates to fail the test.
-async fn with_mount<F>(tuning: Tuning, body: F)
+/// Which transport to reach diod through. Non-TCP transports use a tiny in-test relay that bridges
+/// to diod's TCP port, so all three transports exercise the same server.
+#[derive(Clone, Copy)]
+enum Via {
+    Tcp,
+    Unix,
+    Ws,
+}
+
+/// A resolved connect target handed to the mount task.
+enum Connect {
+    Tcp(String),
+    Unix(PathBuf),
+    Ws(String),
+}
+
+async fn connect_transport(c: Connect) -> Result<Box<dyn NineTransport>, String> {
+    Ok(match c {
+        Connect::Tcp(a) => Box::new(TcpTransport::connect(&a).await.map_err(|e| e.to_string())?),
+        Connect::Unix(p) => Box::new(
+            UnixTransport::connect(&p)
+                .await
+                .map_err(|e| e.to_string())?,
+        ),
+        Connect::Ws(u) => Box::new(
+            WebSocketTransport::connect(&u, &[])
+                .await
+                .map_err(|e| e.to_string())?,
+        ),
+    })
+}
+
+/// Accept Unix connections at `sock` and splice each to a fresh TCP connection to `tcp_addr`.
+async fn spawn_unix_relay(sock: PathBuf, tcp_addr: String) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let tcp_addr = tcp_addr.clone();
+            tokio::spawn(async move {
+                if let Ok(mut up) = tokio::net::TcpStream::connect(&tcp_addr).await {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
+                }
+            });
+        }
+    })
+}
+
+/// A websocket server (ephemeral port) that carries each 9p chunk as a binary frame to/from a TCP
+/// connection to `tcp_addr` -- mirrors a real ws-fronted 9p endpoint bridging to its server.
+async fn spawn_ws_relay(tcp_addr: String) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let tcp_addr = tcp_addr.clone();
+            tokio::spawn(async move {
+                let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let Ok(up) = tokio::net::TcpStream::connect(&tcp_addr).await else {
+                    return;
+                };
+                ws_tcp_bridge(ws, up).await;
+            });
+        }
+    });
+    (port, handle)
+}
+
+async fn ws_tcp_bridge(
+    ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    tcp: tokio::net::TcpStream,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let (mut rd, mut wr) = tcp.into_split();
+    let c2s = async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            if let Message::Binary(b) = msg {
+                if wr.write_all(&b).await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+    let s2c = async move {
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ws_tx
+                        .send(Message::Binary(buf[..n].to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    tokio::select! { _ = c2s => {}, _ = s2c => {} }
+}
+
+/// Start diod, reach it via `via`, FUSE-mount the export with `tuning`, wait until the mount is live,
+/// run `body` (on a blocking thread, with the mountpoint path), then unmount and tear down. Any panic
+/// in `body` propagates to fail the test.
+async fn with_mount_via<F>(via: Via, tuning: Tuning, body: F)
 where
     F: FnOnce(&Path) + Send + 'static,
 {
@@ -179,20 +288,35 @@ where
     // Seed a readiness sentinel in the export; it appears through the mount once FUSE is live.
     std::fs::write(diod.export().join(READY), b"1").unwrap();
 
-    let mountpoint = tempfile::tempdir().unwrap();
-    let mp = mountpoint.path().to_path_buf();
-    let addr = format!("127.0.0.1:{}", diod.port);
+    let tcp_addr = format!("127.0.0.1:{}", diod.port);
     let aname = diod.export().to_string_lossy().into_owned();
     let uid = unsafe { libc::geteuid() };
 
+    // Resolve the connect target, starting a relay to diod's TCP port for non-TCP transports.
+    let reldir = tempfile::tempdir().unwrap();
+    let mut relays: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    let connect = match via {
+        Via::Tcp => Connect::Tcp(tcp_addr.clone()),
+        Via::Unix => {
+            let sock = reldir.path().join("9p.sock");
+            relays.push(spawn_unix_relay(sock.clone(), tcp_addr.clone()).await);
+            Connect::Unix(sock)
+        }
+        Via::Ws => {
+            let (port, h) = spawn_ws_relay(tcp_addr.clone()).await;
+            relays.push(h);
+            Connect::Ws(format!("ws://127.0.0.1:{port}"))
+        }
+    };
+
+    let mountpoint = tempfile::tempdir().unwrap();
+    let mp = mountpoint.path().to_path_buf();
     let mp_task = mp.clone();
     // The task output must be Send, and mount()'s Box<dyn Error> isn't -- stringify it.
     let task = tokio::spawn(async move {
-        let transport = TcpTransport::connect(&addr)
-            .await
-            .map_err(|e| e.to_string())?;
+        let transport = connect_transport(connect).await?;
         // `mount` blocks until unmounted; the error (if any) surfaces after umount below.
-        mount(Box::new(transport), &mp_task, 512_000, uid, &aname, tuning)
+        mount(transport, &mp_task, 512_000, uid, &aname, tuning)
             .await
             .map_err(|e| e.to_string())
     });
@@ -217,12 +341,24 @@ where
 
     umount(&mp);
     let mount_result = task.await.expect("mount task join");
+    for h in relays {
+        h.abort();
+    }
 
     // Surface a body panic first (more informative), then any mount error.
     outcome.expect("test body panicked");
     mount_result.expect("mount() returned an error");
     drop(diod);
+    drop(reldir);
     drop(mountpoint);
+}
+
+/// Convenience: mount over TCP (the common case).
+async fn with_mount<F>(tuning: Tuning, body: F)
+where
+    F: FnOnce(&Path) + Send + 'static,
+{
+    with_mount_via(Via::Tcp, tuning, body).await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -435,6 +571,229 @@ async fn synchronous_writes() {
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"no writeback, one Twrite per write"
+        );
+    })
+    .await;
+}
+
+/// The same core ops over the Unix-socket transport (relayed to diod's TCP port).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unix_transport() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP unix_transport: {reason}");
+        return;
+    }
+    with_mount_via(Via::Unix, Tuning::default(), |mp| {
+        std::fs::write(mp.join("u.txt"), b"over a unix socket").unwrap();
+        assert_eq!(
+            std::fs::read(mp.join("u.txt")).unwrap(),
+            b"over a unix socket"
+        );
+        std::fs::create_dir(mp.join("ud")).unwrap();
+        assert!(mp.join("ud").is_dir());
+    })
+    .await;
+}
+
+/// Core ops over the WebSocket transport, with a payload big enough to span many binary frames --
+/// exercises the ws `Message` <-> byte-chunk mapping and frame reassembly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn websocket_transport() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP websocket_transport: {reason}");
+        return;
+    }
+    with_mount_via(Via::Ws, Tuning::default(), |mp| {
+        let data = vec![0x5au8; 200_000];
+        std::fs::write(mp.join("w.bin"), &data).unwrap();
+        assert_eq!(std::fs::read(mp.join("w.bin")).unwrap(), data);
+    })
+    .await;
+}
+
+/// `statfs` (df) reports a non-zero block size and capacity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn statfs_reports_capacity() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP statfs_reports_capacity: {reason}");
+        return;
+    }
+    with_mount(Tuning::default(), |mp| {
+        let cpath = std::ffi::CString::new(mp.to_str().unwrap()).unwrap();
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::statvfs(cpath.as_ptr(), &mut st) }, 0);
+        assert!(st.f_bsize > 0, "block size should be non-zero");
+        assert!(st.f_blocks > 0, "total blocks should be non-zero");
+    })
+    .await;
+}
+
+/// Truncating (via `setattr` size) shrinks and grows a file; growth zero-fills.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncate_grow_and_shrink() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP truncate_grow_and_shrink: {reason}");
+        return;
+    }
+    with_mount(Tuning::default(), |mp| {
+        let p = mp.join("t");
+        std::fs::write(&p, b"0123456789").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_len(4)
+            .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"0123");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"0123\0\0\0\0");
+    })
+    .await;
+}
+
+/// Setting mtime (via `setattr`) round-trips.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_modified_time() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP set_modified_time: {reason}");
+        return;
+    }
+    with_mount(Tuning::default(), |mp| {
+        let p = mp.join("m");
+        std::fs::write(&p, b"x").unwrap();
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().modified().unwrap(),
+            t,
+            "mtime did not round-trip through setattr"
+        );
+    })
+    .await;
+}
+
+/// Overwriting at an offset on a *write-only* handle: with the writeback cache on this is a
+/// partial-page read-modify-write, so the kernel issues reads on the write-only handle -- which only
+/// works because `open` upgrades write-only opens to O_RDWR under writeback (else the server EBADFs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offset_writes() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP offset_writes: {reason}");
+        return;
+    }
+    with_mount(Tuning::default(), |mp| {
+        use std::io::{Seek, SeekFrom, Write};
+        let p = mp.join("o");
+        std::fs::write(&p, b"hello world").unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.seek(SeekFrom::Start(6)).unwrap();
+        f.write_all(b"WORLD").unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello WORLD");
+    })
+    .await;
+}
+
+/// Appending (O_APPEND) lands at end-of-file. Tested with write-back off: under the FUSE writeback
+/// cache the kernel handles O_APPEND itself, which is not reliable, so append semantics are only
+/// well-defined in the synchronous (writeback-off) mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_writes() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP append_writes: {reason}");
+        return;
+    }
+    let tuning = Tuning {
+        writeback: false,
+        ..Tuning::default()
+    };
+    with_mount(tuning, |mp| {
+        use std::io::Write;
+        let p = mp.join("a");
+        std::fs::write(&p, b"hello").unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b" world").unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(&p).unwrap(), b"hello world");
+    })
+    .await;
+}
+
+/// A directory with enough entries to span multiple `Treaddir` round-trips lists every entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_directory_readdir() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP large_directory_readdir: {reason}");
+        return;
+    }
+    with_mount(Tuning::default(), |mp| {
+        let n = 300;
+        for i in 0..n {
+            std::fs::write(mp.join(format!("f{i:04}")), b"x").unwrap();
+        }
+        let names: std::collections::HashSet<String> = std::fs::read_dir(mp)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        for i in 0..n {
+            assert!(names.contains(&format!("f{i:04}")), "missing f{i:04}");
+        }
+    })
+    .await;
+}
+
+/// Error mappings: ENOENT, EEXIST (O_EXCL / mkdir), ENOTEMPTY, ENOTDIR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn error_paths() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP error_paths: {reason}");
+        return;
+    }
+    with_mount(Tuning::default(), |mp| {
+        use std::io::ErrorKind;
+        // Missing file.
+        assert_eq!(
+            std::fs::read(mp.join("nope")).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        // Exclusive create over an existing file.
+        std::fs::write(mp.join("e"), b"1").unwrap();
+        let excl = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(mp.join("e"))
+            .unwrap_err();
+        assert_eq!(excl.kind(), ErrorKind::AlreadyExists);
+        // mkdir over an existing directory.
+        std::fs::create_dir(mp.join("d")).unwrap();
+        assert_eq!(
+            std::fs::create_dir(mp.join("d")).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        // rmdir on a non-empty directory.
+        std::fs::write(mp.join("d/x"), b"1").unwrap();
+        assert_eq!(
+            std::fs::remove_dir(mp.join("d"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOTEMPTY)
+        );
+        // Descend into a non-directory.
+        assert_eq!(
+            std::fs::create_dir(mp.join("e/sub"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOTDIR)
         );
     })
     .await;

@@ -586,7 +586,14 @@ impl Filesystem for Fuse9p {
             None => return reply.error(libc::ENOENT),
         };
         let newfid = self.client.alloc_fid();
-        let oflags = (flags as u32) & !(libc::O_CLOEXEC as u32);
+        let mut oflags = (flags as u32) & !(libc::O_CLOEXEC as u32);
+        // With the FUSE writeback cache the kernel issues READs on the handle for partial-page
+        // read-modify-write even when the file was opened write-only; the server would then answer
+        // those reads with EBADF on a write-only fid. Upgrade write-only opens to O_RDWR so the
+        // kernel's RMW reads succeed. (Harmless when off, but only needed with writeback on.)
+        if self.tuning.writeback && (oflags & libc::O_ACCMODE as u32) == libc::O_WRONLY as u32 {
+            oflags = (oflags & !(libc::O_ACCMODE as u32)) | libc::O_RDWR as u32;
+        }
         let client = self.client.clone();
         let res = self.rt.block_on(async move {
             client.walk(base, newfid, &[]).await?; // clone the base fid

@@ -236,3 +236,130 @@ pub fn parse_readdir(data: &[u8]) -> Vec<DirEntry> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primitives_roundtrip_little_endian() {
+        let mut w = W::new();
+        w.u8(0xAB)
+            .u16(0x1234)
+            .u32(0xDEAD_BEEF)
+            .u64(0x0102_0304_0506_0708)
+            .str("héllo")
+            .bytes(&[1, 2, 3]);
+        // u16 is little-endian on the wire.
+        assert_eq!(&w.buf[1..3], &[0x34, 0x12]);
+
+        let mut r = R::new(&w.buf);
+        assert_eq!(r.u8(), Some(0xAB));
+        assert_eq!(r.u16(), Some(0x1234));
+        assert_eq!(r.u32(), Some(0xDEAD_BEEF));
+        assert_eq!(r.u64(), Some(0x0102_0304_0506_0708));
+        assert_eq!(r.str().as_deref(), Some("héllo"));
+        assert_eq!(r.remaining(), 3); // the trailing raw bytes
+    }
+
+    #[test]
+    fn short_reads_return_none() {
+        let mut r = R::new(&[0x01, 0x02]);
+        assert_eq!(r.u16(), Some(0x0201));
+        assert_eq!(r.u8(), None); // exhausted
+        assert_eq!(R::new(&[0x01]).u32(), None);
+        // str with a length header longer than the remaining bytes.
+        assert_eq!(R::new(&[0x03, 0x00, b'a']).str(), None);
+    }
+
+    #[test]
+    fn str_empty_and_multibyte() {
+        let mut w = W::new();
+        w.str("");
+        assert_eq!(R::new(&w.buf).str().as_deref(), Some(""));
+
+        let mut w2 = W::new();
+        w2.str("naïve → 世界");
+        assert_eq!(R::new(&w2.buf).str().as_deref(), Some("naïve → 世界"));
+    }
+
+    #[test]
+    fn qid_roundtrip_is_13_bytes() {
+        let mut w = W::new();
+        w.u8(0x80).u32(7).u64(0xCAFE_F00D_1234);
+        assert_eq!(w.buf.len(), 13);
+        let q = R::new(&w.buf).qid().unwrap();
+        assert_eq!((q.typ, q.version, q.path), (0x80, 7, 0xCAFE_F00D_1234));
+    }
+
+    // A well-formed Rgetattr body, plus the trailing btime/gen/data_version fields the parser ignores.
+    fn getattr_body(mode: u32, size: u64, qid_path: u64) -> Vec<u8> {
+        let mut w = W::new();
+        w.u64(GETATTR_ALL);
+        w.u8(0).u32(3).u64(qid_path); // qid
+        w.u32(mode).u32(1000).u32(1001); // mode, uid, gid
+        w.u64(2) // nlink
+            .u64(0) // rdev
+            .u64(size)
+            .u64(4096) // blksize
+            .u64(size.div_ceil(512)); // blocks
+        w.u64(11).u64(0); // atime
+        w.u64(22).u64(0); // mtime
+        w.u64(33).u64(0); // ctime
+        w.u64(44).u64(0).u64(0); // btime, gen, data_version (ignored)
+        w.buf
+    }
+
+    #[test]
+    fn parse_getattr_reads_fields_and_ignores_trailing() {
+        let a = parse_getattr(&getattr_body(0o100_644, 4242, 99)).unwrap();
+        assert_eq!(a.mode, 0o100_644);
+        assert_eq!(a.uid, 1000);
+        assert_eq!(a.gid, 1001);
+        assert_eq!(a.size, 4242);
+        assert_eq!(a.qid.path, 99);
+        assert_eq!(a.mtime, (22, 0));
+        assert_eq!(a.ctime, (33, 0));
+    }
+
+    #[test]
+    fn parse_getattr_truncated_is_none() {
+        let mut body = getattr_body(0o100_644, 1, 0);
+        body.truncate(20); // cut mid-structure
+        assert!(parse_getattr(&body).is_none());
+    }
+
+    fn push_dirent(w: &mut W, qid_path: u64, off: u64, typ: u8, name: &str) {
+        w.u8(0).u32(0).u64(qid_path); // qid
+        w.u64(off).u8(typ).str(name);
+    }
+
+    #[test]
+    fn parse_readdir_multiple_entries() {
+        let mut w = W::new();
+        push_dirent(&mut w, 10, 1, 0x80, ".");
+        push_dirent(&mut w, 11, 2, 0x80, "..");
+        push_dirent(&mut w, 12, 3, 0, "file.txt");
+        let ents = parse_readdir(&w.buf);
+        assert_eq!(ents.len(), 3);
+        assert_eq!(ents[0].qid.path, 10);
+        assert_eq!(ents[2].name, "file.txt");
+        assert_eq!(ents[2].offset, 3);
+    }
+
+    #[test]
+    fn parse_readdir_stops_on_truncated_tail() {
+        let mut w = W::new();
+        push_dirent(&mut w, 10, 1, 0x80, "ok");
+        push_dirent(&mut w, 11, 2, 0, "partial");
+        w.buf.truncate(w.buf.len() - 4); // chop the last entry's name
+        let ents = parse_readdir(&w.buf);
+        assert_eq!(ents.len(), 1);
+        assert_eq!(ents[0].name, "ok");
+    }
+
+    #[test]
+    fn parse_readdir_empty() {
+        assert!(parse_readdir(&[]).is_empty());
+    }
+}
