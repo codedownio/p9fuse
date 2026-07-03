@@ -13,8 +13,7 @@ network link.
 > **Why this exists.** The Rust ecosystem has good 9p *servers* and protocol libraries (rs9p, p9,
 > ninep) but, until now, **no maintained client that mounts a remote 9p server over FUSE** — the
 > existing options are the privileged in-kernel v9fs client or aging C/Python FUSE clients. `p9fuse`
-> fills that gap. It began as (and is battle-tested in production by) [codedown](https://codedown.io)'s
-> per-home 9p mounter.
+> fills that gap.
 
 ## Features
 
@@ -129,9 +128,9 @@ made safe by an invalidation channel that evicts stale entries on demand.
 
 ## Status
 
-Production-proven in codedown, but young as a standalone crate. A public integration test suite
-(round-tripping against `diod` and rs9p's `unpfs`, covering POSIX semantics, cache coherence, and
-write-back integrity) is in progress — see the repo issues for the roadmap.
+The core is production-tested; the standalone crate is young. The test suite mounts a real `diod`
+export over FUSE (POSIX semantics, rename, write-back) across the TCP/Unix/WebSocket transports and
+unit-tests the 9p wire codec; an `unpfs` (rs9p) interop target is on the roadmap.
 
 ## License
 
