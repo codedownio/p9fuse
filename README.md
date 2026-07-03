@@ -128,9 +128,9 @@ made safe by an invalidation channel that evicts stale entries on demand.
 
 ## Status
 
-The core is production-tested; the standalone crate is young. The test suite mounts a real `diod`
-export over FUSE (POSIX semantics, rename, write-back) across the TCP/Unix/WebSocket transports and
-unit-tests the 9p wire codec; an `unpfs` (rs9p) interop target is on the roadmap.
+The test suite mounts a real `diod` export over FUSE (POSIX semantics, rename,
+write-back) across the TCP/Unix/WebSocket transports and unit-tests the 9p wire
+codec; an `unpfs` (rs9p) interop target is on the roadmap.
 
 ## License
 
