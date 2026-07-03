@@ -134,4 +134,4 @@ codec; an `unpfs` (rs9p) interop target is on the roadmap.
 
 ## License
 
-Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
+[MIT](LICENSE-MIT).
