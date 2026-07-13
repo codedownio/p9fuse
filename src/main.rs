@@ -85,6 +85,12 @@ enum Cmd {
 
         mountpoint: PathBuf,
     },
+
+    /// Make a directory a shared mount point: bind it onto itself, detach it to MS_PRIVATE, then
+    /// mark it MS_SHARED. A filesystem mounted on it *afterwards* then propagates into existing bind
+    /// mounts of it. Needs CAP_SYS_ADMIN, so run this as root or via a setuid-root install.
+    #[command(name = "make-shared")]
+    MakeShared { path: PathBuf },
 }
 
 #[tokio::main]
@@ -129,6 +135,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             fuse9p::Fuse9p::run(transport, &mountpoint, msize as u32, uid, &aname, tuning).await
         }
+        Cmd::MakeShared { path } => make_shared(&path),
+    }
+}
+
+/// Make `path` a shared mount point. Bind it onto itself so it becomes a mount, detach it from any
+/// inherited master (you can't make a *slave* mount shared -- EINVAL, which is the state mounts are
+/// in inside a container/kata), then mark it MS_SHARED so a later mount on it propagates into bind
+/// mounts of it. Requires CAP_SYS_ADMIN (this binary is setuid-root).
+fn make_shared(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use nix::mount::{mount, MsFlags};
+    let none = None::<&str>;
+    mount(Some(path), path, none, MsFlags::MS_BIND, none)?;
+    mount(none, path, none, MsFlags::MS_PRIVATE, none)?;
+    mount(none, path, none, MsFlags::MS_SHARED, none)?;
+    Ok(())
+}
+
+/// How long `build_transport` retries a local endpoint that isn't accepting connections yet.
+const CONNECT_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Retry `attempt` while it fails with "connection refused" / "not found", up to `CONNECT_RETRY`.
+/// A freshly-started server may not be listening (or its unix socket may not exist) the instant we
+/// dial it; riding out that brief window here avoids failing the whole mount over a startup race.
+async fn retry_connect<T, Fut>(mut attempt: impl FnMut() -> Fut) -> std::io::Result<T>
+where
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let deadline = tokio::time::Instant::now() + CONNECT_RETRY;
+    loop {
+        match attempt().await {
+            Ok(t) => return Ok(t),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -138,9 +185,10 @@ async fn build_transport(
     headers: &[(String, String)],
 ) -> Result<Box<dyn NineTransport>, Box<dyn std::error::Error>> {
     if let Some(addr) = connect.strip_prefix("tcp://") {
-        Ok(Box::new(TcpTransport::connect(addr).await?))
+        Ok(Box::new(retry_connect(|| TcpTransport::connect(addr)).await?))
     } else if let Some(path) = connect.strip_prefix("unix://") {
-        Ok(Box::new(UnixTransport::connect(Path::new(path)).await?))
+        let path = Path::new(path);
+        Ok(Box::new(retry_connect(|| UnixTransport::connect(path)).await?))
     } else if connect.starts_with("ws://") || connect.starts_with("wss://") {
         Ok(Box::new(
             WebSocketTransport::connect(connect, headers).await?,
