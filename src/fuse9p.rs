@@ -358,8 +358,23 @@ async fn invalidation_loop(
     root_qid_path: u64,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
+    // The notifier calls are synchronous writes to /dev/fuse, and the kernel processes a
+    // notify_inval_entry under the parent directory's inode lock -- which an in-flight LOOKUP of
+    // that directory holds until WE answer it. Issuing the notify from a runtime worker can
+    // therefore deadlock the whole mount (notify blocks the worker -> the 9p reply that would
+    // complete the LOOKUP is never processed -> the kernel never releases the lock -> the notify
+    // never returns). Run every notify on a blocking thread so the runtime keeps servicing 9p.
+    let notifier = std::sync::Arc::new(notifier);
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(?e, "mount9p-fuse: error reading invalidation stdin");
+                break;
+            }
+        };
         let rel = line.trim().trim_start_matches('/');
         if rel.is_empty() {
             continue;
@@ -379,13 +394,20 @@ async fn invalidation_loop(
                 let pqp = qids.last().map(|q| q.path).unwrap_or(root_qid_path);
                 Some(qid_to_ino(pqp, root_qid_path))
             }
-            Err(_) => {
+            Err(e) => {
                 let _ = client.clunk(pf).await;
+                tracing::warn!(rel, ?e, "mount9p-fuse: invalidation parent walk failed");
                 None
             }
         };
         if let Some(pino) = parent_ino {
-            let _ = notifier.inval_entry(pino, std::ffi::OsStr::new(*name));
+            let n = notifier.clone();
+            let name_owned = name.to_string();
+            let r = tokio::task::spawn_blocking(move || {
+                n.inval_entry(pino, std::ffi::OsStr::new(&name_owned))
+            })
+            .await;
+            tracing::info!(rel, pino, name, result = ?r, "mount9p-fuse: inval_entry");
         }
 
         // Child inode -> drop cached attrs + data (forces re-read of changed content).
@@ -394,11 +416,15 @@ async fn invalidation_loop(
             Ok(qids) => {
                 let _ = client.clunk(cf).await;
                 if let Some(q) = qids.last() {
-                    let _ = notifier.inval_inode(qid_to_ino(q.path, root_qid_path), 0, 0);
+                    let ino = qid_to_ino(q.path, root_qid_path);
+                    let n = notifier.clone();
+                    let r = tokio::task::spawn_blocking(move || n.inval_inode(ino, 0, 0)).await;
+                    tracing::info!(rel, ino, result = ?r, "mount9p-fuse: inval_inode");
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 let _ = client.clunk(cf).await;
+                tracing::warn!(rel, ?e, "mount9p-fuse: invalidation child walk failed");
             }
         }
     }

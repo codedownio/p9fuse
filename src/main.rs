@@ -95,8 +95,11 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Log to stderr: stdin/stdout are protocol channels (invalidation paths arrive on stdin), so
+    // stdout must stay clean.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
 
     match Args::parse().cmd {
