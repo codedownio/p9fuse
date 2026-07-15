@@ -32,6 +32,10 @@ pub struct NineClient {
     next_fid: AtomicU32,
     pub msize: u32,
     pub root_fid: u32,
+    /// Flips to `true` once the read pump sees the transport's read half close (permanently). The
+    /// FUSE mount watches this to exit, so a dead mount is torn down and remounted by its supervisor
+    /// instead of lingering and answering every request with EIO.
+    transport_gone: tokio::sync::watch::Sender<bool>,
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
@@ -49,6 +53,7 @@ impl NineClient {
     ) -> Result<(Arc<NineClient>, Qid), Box<dyn std::error::Error>> {
         let (sink, mut stream) = transport.split();
 
+        let (transport_gone, _) = tokio::sync::watch::channel(false);
         let client = Arc::new(NineClient {
             sink: tokio::sync::Mutex::new(sink),
             pending: Mutex::new(HashMap::new()),
@@ -56,6 +61,7 @@ impl NineClient {
             next_fid: AtomicU32::new(ROOT_FID + 1),
             msize,
             root_fid: ROOT_FID,
+            transport_gone,
         });
 
         // Read pump: reassemble frames and route to waiters by tag.
@@ -74,8 +80,10 @@ impl NineClient {
                     Err(_) => break,
                 }
             }
-            // Transport gone: drop all waiters so their requests fail instead of hanging.
+            // Transport gone: drop all waiters so their requests fail instead of hanging, and signal
+            // the mount to exit so a dead mount is torn down and remounted rather than serving EIO.
             pump.pending.lock().unwrap().clear();
+            let _ = pump.transport_gone.send(true);
         });
 
         // Version handshake (tag NOTAG), then attach.
@@ -87,6 +95,13 @@ impl NineClient {
         }
         let root_qid = client.attach(ROOT_FID, "user", aname, n_uname).await?;
         Ok((client, root_qid))
+    }
+
+    /// A watch receiver that flips to `true` once the read transport has closed permanently. The
+    /// FUSE mount watches this to exit (so the mount is torn down and remounted); other callers
+    /// (protocol-level use, tests) can ignore it and just see their requests fail with EIO.
+    pub fn transport_gone(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.transport_gone.subscribe()
     }
 
     fn dispatch(&self, frame: Frame) {

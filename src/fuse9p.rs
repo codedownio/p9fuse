@@ -280,11 +280,20 @@ impl Fuse9p {
         uid: u32,
         aname: &str,
         tuning: Tuning,
+        // When the 9p transport closes we always exit (so a supervisor can remount). If this is set we
+        // also lazily detach the mount first, so the mountpoint reverts to its underlying contents
+        // instead of lingering as a dead ENOTCONN mount. Detaching lets a supervisor remount cleanly at
+        // the same path (the default); leaving it undetached keeps failed I/O visible as ENOTCONN
+        // rather than briefly exposing whatever is underneath.
+        detach_on_transport_loss: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(?tuning, "mount9p-fuse: tuning");
         // Attach as `uid` so the server acts as that user for file ops (a multiuser server like diod
         // setfsuids to it per attach), so files are owned by `uid` and chmod works.
         let (client, root_qid) = NineClient::connect(transport, msize, uid, aname).await?;
+        // Watch for the 9p transport closing: if it does, the mount is dead (every op would just
+        // return EIO), so we exit below and let whatever supervises this process remount.
+        let mut transport_gone = client.transport_gone();
 
         let mut inodes = HashMap::new();
         inodes.insert(
@@ -339,10 +348,30 @@ impl Fuse9p {
             root_qid_path,
         ));
         // session.run() blocks for the life of the mount; run it off the async executor so the
-        // runtime stays free to service the client's (and invalidation task's) requests.
-        tokio::task::spawn_blocking(move || session.run())
-            .await?
-            .map_err(|e| e.into())
+        // runtime stays free to service the client's (and invalidation task's) requests. Race it
+        // against the transport closing: on a dead transport the session would otherwise keep
+        // running and answer every op with EIO forever, so exit instead -- the kernel tears down the
+        // FUSE mount when we exit, and the supervising mount loop remounts against a fresh transport.
+        let session_task = tokio::task::spawn_blocking(move || session.run());
+        tokio::select! {
+            r = session_task => r?.map_err(|e| e.into()),
+            res = transport_gone.wait_for(|&gone| gone) => {
+                let _ = res;
+                // On daemon exit the kernel leaves the mount in place answering ENOTCONN (it does *not*
+                // auto-remove it), which would block a clean remount at the same path. When enabled, a
+                // lazy detach reverts the mountpoint immediately (and, since we made it a shared mount,
+                // propagates the detach into the sandbox bind) so the supervising mount loop can remount
+                // fresh -- mirroring mount9p's umount-on-exit. When disabled we just exit, leaving a
+                // dead ENOTCONN mount so I/O fails loudly rather than exposing the underlying dir.
+                if detach_on_transport_loss {
+                    tracing::error!("mount9p-fuse: 9p transport closed; detaching the mount and exiting so it is remounted");
+                    let _ = nix::mount::umount2(mp.as_path(), nix::mount::MntFlags::MNT_DETACH);
+                } else {
+                    tracing::error!("mount9p-fuse: 9p transport closed; exiting so it is remounted (no detach)");
+                }
+                std::process::exit(75); // EX_TEMPFAIL; the mount loop that spawned us restarts us
+            }
+        }
     }
 }
 

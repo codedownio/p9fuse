@@ -83,6 +83,13 @@ enum Cmd {
         #[arg(long, default_value_t = 16)]
         wb_depth: usize,
 
+        /// On 9p transport loss the daemon always exits (so a supervisor can remount). When true it
+        /// also lazily detaches the mount first, so the mountpoint reverts to its underlying contents
+        /// and a supervisor can remount cleanly at the same path. Pass false to leave the dead mount in
+        /// place (I/O then fails with ENOTCONN rather than briefly exposing what's underneath).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        detach_on_transport_loss: bool,
+
         mountpoint: PathBuf,
     },
 
@@ -124,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             readdirplus,
             writeback,
             wb_depth,
+            detach_on_transport_loss,
             mountpoint,
         } => {
             let transport = build_transport(&connect, &parse_headers(&headers)?).await?;
@@ -136,7 +144,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 writeback,
                 wb_depth,
             };
-            fuse9p::Fuse9p::run(transport, &mountpoint, msize as u32, uid, &aname, tuning).await
+            fuse9p::Fuse9p::run(
+                transport,
+                &mountpoint,
+                msize as u32,
+                uid,
+                &aname,
+                tuning,
+                detach_on_transport_loss,
+            )
+            .await
         }
         Cmd::MakeShared { path } => make_shared(&path),
     }
