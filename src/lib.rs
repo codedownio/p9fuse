@@ -42,6 +42,9 @@ use std::path::Path;
 /// - `uid` is the identity to attach as (`n_uname`); the server acts as this user for file ops.
 /// - `aname` is the export name to attach (must match the server's export, e.g. `"/export"`).
 /// - `tuning` controls the caching / write-back knobs (see [`Tuning`]).
+///
+/// On 9p transport loss this exits and detaches the mount so a supervisor can remount cleanly (the
+/// default). Call [`Fuse9p::run`] directly to control that with `detach_on_transport_loss`.
 pub async fn mount(
     transport: Box<dyn NineTransport>,
     mountpoint: &Path,
@@ -50,5 +53,5 @@ pub async fn mount(
     aname: &str,
     tuning: Tuning,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    Fuse9p::run(transport, mountpoint, msize, uid, aname, tuning).await
+    Fuse9p::run(transport, mountpoint, msize, uid, aname, tuning, true).await
 }
