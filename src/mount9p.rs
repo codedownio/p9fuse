@@ -27,10 +27,14 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
 
 /// Split `transport`, mount the v9fs client at `mountpoint`, and bridge bytes until either side
 /// closes. Best-effort unmount on exit. `aname` is fixed to `/export` in the mount options below.
+///
+/// `cache` is v9fs's cache mode, passed through as-is (`none`, `readahead`, `mmap`, `loose`,
+/// `fscache`); see the note on the mount options below for how to pick one.
 pub async fn mount9p(
     transport: Box<dyn NineTransport>,
     mountpoint: &Path,
     msize: usize,
+    cache: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Split the transport into its 9p byte sink/stream.
     let (mut sink, mut stream) = transport.split();
@@ -83,9 +87,17 @@ pub async fn mount9p(
     // `aname=/export`: a server like diod (`diod -e /export`) only honors attaches whose aname names
     // an exported path. A multiuser server running as root setfsuids per attach (root at mount, the
     // attaching uid for file ops), so no client `access=`/uid option is needed and file ownership
-    // follows the accessing uid. `cache=loose` favors throughput for a single client.
+    // follows the accessing uid.
+    //
+    // The cache mode is the caller's call, because it decides correctness, not just speed. Under
+    // `cache=loose`, v9fs_vfs_getattr answers from the cached inode and never asks the server, and
+    // nothing can drop that -- the kernel client has no equivalent of the FUSE bridge's notify path.
+    // A file rewritten on the server then keeps its old size and contents for this client forever,
+    // so `loose` is only safe when nothing else writes to the export. `mmap` (the default) still
+    // caches pages, so files can be mapped and executed out of the mount, but revalidates against
+    // the server so out-of-band writes show up.
     let data = format!(
-        "trans=fd,rfdno={fd},wfdno={fd},version=9p2000.L,msize={msize},cache=loose,aname=/export"
+        "trans=fd,rfdno={fd},wfdno={fd},version=9p2000.L,msize={msize},cache={cache},aname=/export"
     );
     let mp = mountpoint.to_path_buf();
     tracing::info!(?mp, %data, "mount9p: mounting v9fs");

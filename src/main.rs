@@ -33,6 +33,14 @@ enum Cmd {
         /// 9p msize (max message size) in bytes.
         #[arg(long, default_value_t = 512000)]
         msize: usize,
+        /// v9fs cache mode: none, readahead, mmap, loose, fscache. This is a correctness knob, not
+        /// just a speed one: `loose` never revalidates against the server, and the kernel client has
+        /// no invalidation hook, so anything written to the export out of band stays invisible to
+        /// this mount forever. Only use it when nothing else writes to the export. The default,
+        /// `mmap`, still caches pages (so files can be mapped and executed out of the mount) but
+        /// revalidates, so out-of-band writes show up.
+        #[arg(long, default_value = "mmap")]
+        cache: String,
         mountpoint: PathBuf,
     },
 
@@ -114,10 +122,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             connect,
             headers,
             msize,
+            cache,
             mountpoint,
         } => {
             let transport = build_transport(&connect, &parse_headers(&headers)?).await?;
-            mount9p::mount9p(transport, &mountpoint, msize).await
+            mount9p::mount9p(transport, &mountpoint, msize, &cache).await
         }
         Cmd::Mount9pFuse {
             connect,
