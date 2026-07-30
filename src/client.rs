@@ -68,6 +68,7 @@ impl NineClient {
         let pump = client.clone();
         tokio::spawn(async move {
             let mut acc: Vec<u8> = Vec::with_capacity(1 << 16);
+            tracing::debug!("read pump: started");
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(chunk) => {
@@ -77,7 +78,10 @@ impl NineClient {
                         }
                     }
                     // Transport error: stop pumping; the cleanup below fails all waiters.
-                    Err(_) => break,
+                    Err(_) => {
+                        tracing::debug!("read pump: transport error, stopping");
+                        break;
+                    }
                 }
             }
             // Transport gone: drop all waiters so their requests fail instead of hanging, and signal
@@ -112,7 +116,10 @@ impl NineClient {
             body: frame.body[2..].to_vec(),
         };
         if let Some(tx) = self.pending.lock().unwrap().remove(&tag) {
+            tracing::debug!(tag, "dispatch: routing reply to waiter");
             let _ = tx.send(payload);
+        } else {
+            tracing::debug!(tag, "dispatch: no waiter for tag (dropped reply)");
         }
     }
 
@@ -132,8 +139,14 @@ impl NineClient {
     /// Send a T-message body and await the matching response. Returns Err(errno) on Rlerror or a
     /// transport/protocol failure (mapped to EIO).
     async fn transact(&self, mtype: u8, tag: u16, body: &[u8]) -> Result<Frame, i32> {
+        // TEMPORARY DIAGNOSTIC (see the mount-stall investigation): a stalled mount shows the
+        // kernel handing us a request that never reaches the wire, so trace each stage of the
+        // send. Whichever of these is the last line for a tag says where it stopped: waiting for
+        // the sink, inside send(), or waiting for the reply.
+        tracing::debug!(mtype, tag, "transact: enter");
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(tag, tx);
+        tracing::debug!(mtype, tag, "transact: registered waiter, acquiring sink");
 
         let size = (4 + 1 + 2 + body.len()) as u32;
         let mut frame = Vec::with_capacity(size as usize);
@@ -144,11 +157,14 @@ impl NineClient {
 
         {
             let mut sink = self.sink.lock().await;
+            tracing::debug!(mtype, tag, "transact: sink acquired, sending");
             if sink.send(frame).await.is_err() {
                 self.pending.lock().unwrap().remove(&tag);
+                tracing::debug!(mtype, tag, "transact: send failed");
                 return Err(libc::EIO);
             }
         }
+        tracing::debug!(mtype, tag, "transact: sent, awaiting reply");
 
         match rx.await {
             Ok(resp) => {
