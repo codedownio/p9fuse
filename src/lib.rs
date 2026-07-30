@@ -44,7 +44,7 @@ use std::path::Path;
 /// - `tuning` controls the caching / write-back knobs (see [`Tuning`]).
 ///
 /// On 9p transport loss this exits and detaches the mount so a supervisor can remount cleanly (the
-/// default). Call [`Fuse9p::run`] directly to control that with `detach_on_transport_loss`.
+/// default), and with `default_permissions` on. Call [`Fuse9p::run`] directly to control either.
 pub async fn mount(
     transport: Box<dyn NineTransport>,
     mountpoint: &Path,
@@ -53,5 +53,5 @@ pub async fn mount(
     aname: &str,
     tuning: Tuning,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    Fuse9p::run(transport, mountpoint, msize, uid, aname, tuning, true).await
+    Fuse9p::run(transport, mountpoint, msize, uid, aname, tuning, true, true).await
 }

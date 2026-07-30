@@ -286,6 +286,9 @@ impl Fuse9p {
         // the same path (the default); leaving it undetached keeps failed I/O visible as ENOTCONN
         // rather than briefly exposing whatever is underneath.
         detach_on_transport_loss: bool,
+        // Whether to mount with `default_permissions`. See the mount-option block below for when you
+        // would want it off.
+        default_permissions: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(?tuning, "mount9p-fuse: tuning");
         // Attach as `uid` so the server acts as that user for file ops (a multiuser server like diod
@@ -324,8 +327,20 @@ impl Fuse9p {
         let mut options = vec![
             MountOption::FSName("p9fuse".to_string()),
             MountOption::Subtype("9p".to_string()),
-            MountOption::DefaultPermissions,
         ];
+        // `default_permissions` asks the kernel to do the permission checks itself, against the
+        // owner/mode the server reports for each inode. That's the right default -- it's cheap and
+        // it makes the mount behave like a local filesystem.
+        //
+        // Turn it off when the server can't report a truthful owner for the export root. Exporting
+        // the root of a bind mount does that: the host presents a bind's mount root as owned by
+        // root whatever owns it underneath, so the kernel then refuses to let the mounting user
+        // create anything at the top of its own home -- EACCES on writes while reads keep working.
+        // With it off the kernel defers to us, and the server (diod squashing to a single uid) is
+        // the thing actually authorized against the backing store.
+        if default_permissions {
+            options.push(MountOption::DefaultPermissions);
+        }
         // When mounting as root, the mount is root-owned but processes running as another uid can
         // only traverse it with `allow_other`. Only root may set allow_other without
         // `user_allow_other` in /etc/fuse.conf, so gate it on euid 0 -- an unprivileged mount is

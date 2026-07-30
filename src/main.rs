@@ -97,6 +97,12 @@ enum Cmd {
         /// place (I/O then fails with ENOTCONN rather than briefly exposing what's underneath).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         detach_on_transport_loss: bool,
+        /// Let the kernel enforce permissions against the owner/mode the 9p server reports. Pass
+        /// false when the server can't report a truthful owner for the export root -- notably when
+        /// the export is the root of a bind mount, which the host presents as root-owned however it
+        /// is owned underneath, making the mount unwritable for anyone else.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        default_permissions: bool,
 
         mountpoint: PathBuf,
     },
@@ -141,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeback,
             wb_depth,
             detach_on_transport_loss,
+            default_permissions,
             mountpoint,
         } => {
             let transport = build_transport(&connect, &parse_headers(&headers)?).await?;
@@ -161,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &aname,
                 tuning,
                 detach_on_transport_loss,
+                default_permissions,
             )
             .await
         }
