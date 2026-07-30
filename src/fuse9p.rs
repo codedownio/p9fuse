@@ -286,6 +286,8 @@ impl Fuse9p {
         // the same path (the default); leaving it undetached keeps failed I/O visible as ENOTCONN
         // rather than briefly exposing whatever is underneath.
         detach_on_transport_loss: bool,
+        // Whether to mount with `default_permissions`.
+        default_permissions: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(?tuning, "mount9p-fuse: tuning");
         // Attach as `uid` so the server acts as that user for file ops (a multiuser server like diod
@@ -324,8 +326,10 @@ impl Fuse9p {
         let mut options = vec![
             MountOption::FSName("p9fuse".to_string()),
             MountOption::Subtype("9p".to_string()),
-            MountOption::DefaultPermissions,
         ];
+        if default_permissions {
+            options.push(MountOption::DefaultPermissions);
+        }
         // When mounting as root, the mount is root-owned but processes running as another uid can
         // only traverse it with `allow_other`. Only root may set allow_other without
         // `user_allow_other` in /etc/fuse.conf, so gate it on euid 0 -- an unprivileged mount is
@@ -333,6 +337,7 @@ impl Fuse9p {
         if nix::unistd::geteuid().as_raw() == 0 {
             options.push(MountOption::AllowOther);
         }
+
         let mp = mountpoint.to_path_buf();
         tracing::info!(?mp, "mount9p-fuse: mounting FUSE filesystem");
         // Use Session (not fuser::mount2) so we can take a Notifier: that's how out-of-band changes
