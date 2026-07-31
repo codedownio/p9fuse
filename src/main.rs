@@ -97,6 +97,9 @@ enum Cmd {
         /// place (I/O then fails with ENOTCONN rather than briefly exposing what's underneath).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         detach_on_transport_loss: bool,
+        /// Let the kernel enforce permissions against the owner/mode the 9p server reports.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        default_permissions: bool,
 
         mountpoint: PathBuf,
     },
@@ -141,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             writeback,
             wb_depth,
             detach_on_transport_loss,
+            default_permissions,
             mountpoint,
         } => {
             let transport = build_transport(&connect, &parse_headers(&headers)?).await?;
@@ -161,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &aname,
                 tuning,
                 detach_on_transport_loss,
+                default_permissions,
             )
             .await
         }
@@ -214,10 +219,14 @@ async fn build_transport(
     headers: &[(String, String)],
 ) -> Result<Box<dyn NineTransport>, Box<dyn std::error::Error>> {
     if let Some(addr) = connect.strip_prefix("tcp://") {
-        Ok(Box::new(retry_connect(|| TcpTransport::connect(addr)).await?))
+        Ok(Box::new(
+            retry_connect(|| TcpTransport::connect(addr)).await?,
+        ))
     } else if let Some(path) = connect.strip_prefix("unix://") {
         let path = Path::new(path);
-        Ok(Box::new(retry_connect(|| UnixTransport::connect(path)).await?))
+        Ok(Box::new(
+            retry_connect(|| UnixTransport::connect(path)).await?,
+        ))
     } else if connect.starts_with("ws://") || connect.starts_with("wss://") {
         Ok(Box::new(
             WebSocketTransport::connect(connect, headers).await?,
