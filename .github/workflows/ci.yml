@@ -1,10 +1,5 @@
 name: CI
 
-# Runs on the self-hosted Nix runners, where nix (with flakes) and a setuid `fusermount3`
-# (/run/wrappers/bin) are already present -- so every tool comes from the flake: no apt, no rustup,
-# no nix-installer. `nix flake check` runs build + clippy (-D warnings) + rustfmt; the FUSE
-# integration tests run under `nix develop` because they need /dev/fuse.
-
 on:
   push:
   pull_request:
@@ -12,17 +7,13 @@ on:
 
 jobs:
   ci:
-    runs-on: [self-hosted, Linux]
+    runs-on: arc-medium
     if: "!contains(github.event.head_commit.message, 'noci')"
     steps:
       - uses: actions/checkout@v5
 
-      # Build + clippy (-D warnings) + rustfmt, all defined as flake checks.
       - name: nix flake check
         run: nix flake check -L
 
-      # Integration tests mount a real diod export over FUSE, so they need /dev/fuse and a *setuid*
-      # `fusermount3` -- put /run/wrappers/bin ahead of the dev shell's non-setuid fusermount3 (set
-      # inside `nix develop`, since nix re-prepends its own bins).
       - name: integration tests (diod + FUSE)
         run: nix develop -c bash -c 'export PATH="/run/wrappers/bin:$PATH"; cargo test'
