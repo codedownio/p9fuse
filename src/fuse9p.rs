@@ -273,6 +273,7 @@ fn to_fileattr(ino: u64, a: &Attr) -> FileAttr {
 impl Fuse9p {
     /// Mount at `mountpoint`, blocking until unmounted. Builds the client, attaches, then runs the
     /// FUSE session on a blocking thread (callbacks bridge back to the runtime via `Handle`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         transport: Box<dyn crate::transport::NineTransport>,
         mountpoint: &Path,
