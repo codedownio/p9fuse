@@ -219,10 +219,14 @@ async fn build_transport(
     headers: &[(String, String)],
 ) -> Result<Box<dyn NineTransport>, Box<dyn std::error::Error>> {
     if let Some(addr) = connect.strip_prefix("tcp://") {
-        Ok(Box::new(retry_connect(|| TcpTransport::connect(addr)).await?))
+        Ok(Box::new(
+            retry_connect(|| TcpTransport::connect(addr)).await?,
+        ))
     } else if let Some(path) = connect.strip_prefix("unix://") {
         let path = Path::new(path);
-        Ok(Box::new(retry_connect(|| UnixTransport::connect(path)).await?))
+        Ok(Box::new(
+            retry_connect(|| UnixTransport::connect(path)).await?,
+        ))
     } else if connect.starts_with("ws://") || connect.starts_with("wss://") {
         Ok(Box::new(
             WebSocketTransport::connect(connect, headers).await?,
