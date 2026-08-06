@@ -5,7 +5,9 @@
 //! or `fd://N` for a socket that was already connected and handed to us.
 
 use clap::{Parser, Subcommand};
-use p9fuse::transport::{FdTransport, NineTransport, TcpTransport, UnixTransport, WebSocketTransport};
+use p9fuse::transport::{
+    FdTransport, NineTransport, TcpTransport, UnixTransport, WebSocketTransport,
+};
 use p9fuse::{fuse9p, mount9p};
 use std::path::{Path, PathBuf};
 
