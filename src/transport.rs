@@ -66,6 +66,79 @@ impl NineTransport for TcpTransport {
     }
 }
 
+/// 9p over a socket someone else already connected and passed to us on a file descriptor.
+///
+/// For the case where this process cannot do the connecting: the peer dials *in*, and whoever
+/// accepted the connection hands the socket over (as stdin, say) rather than relaying its bytes.
+/// That keeps every byte on a direct kernel path between the 9p server and this process.
+///
+/// Takes ownership of `fd`, and works for either an AF_INET/AF_INET6 or an AF_UNIX socket --
+/// whoever accepted it decides which, so ask the kernel rather than assume.
+pub struct FdTransport(FdInner);
+
+enum FdInner {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl FdTransport {
+    /// # Safety
+    /// `fd` must be a connected socket that nothing else owns or reads/writes concurrently.
+    pub unsafe fn from_raw_fd(fd: std::os::unix::io::RawFd) -> io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
+
+        // tokio requires a nonblocking fd; an inherited one usually isn't.
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut domain: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            &mut domain as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        match domain {
+            libc::AF_UNIX => Ok(Self(FdInner::Unix(UnixStream::from_std(
+                std::os::unix::net::UnixStream::from_raw_fd(fd),
+            )?))),
+            libc::AF_INET | libc::AF_INET6 => Ok(Self(FdInner::Tcp(TcpStream::from_std(
+                std::net::TcpStream::from_raw_fd(fd),
+            )?))),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("fd {fd} is a socket of unsupported domain {other}"),
+            )),
+        }
+    }
+}
+
+impl NineTransport for FdTransport {
+    fn split(self: Box<Self>) -> (ByteSink, ByteStream) {
+        match self.0 {
+            FdInner::Tcp(s) => {
+                let (rd, wr) = s.into_split();
+                framed(rd, wr)
+            }
+            FdInner::Unix(s) => {
+                let (rd, wr) = s.into_split();
+                framed(rd, wr)
+            }
+        }
+    }
+}
+
 /// 9p over a Unix-domain socket -- for a server on the same host (rootless diod, a local export).
 pub struct UnixTransport(pub UnixStream);
 

@@ -1,10 +1,13 @@
 //! `p9fuse` binary: a general-purpose 9p2000.L mounter built on the `p9fuse` library crate. Two
 //! subcommands mount a remote 9p server -- `mount9p` via the kernel v9fs client (needs
 //! CAP_SYS_ADMIN) and `mount9p-fuse` via an unprivileged userspace FUSE bridge. The server is
-//! selected by `--connect`'s URL scheme: `tcp://host:port`, `unix:///path`, or `ws://` / `wss://`.
+//! selected by `--connect`'s URL scheme: `tcp://host:port`, `unix:///path`, `ws://` / `wss://`,
+//! or `fd://N` for a socket that was already connected and handed to us.
 
 use clap::{Parser, Subcommand};
-use p9fuse::transport::{NineTransport, TcpTransport, UnixTransport, WebSocketTransport};
+use p9fuse::transport::{
+    FdTransport, NineTransport, TcpTransport, UnixTransport, WebSocketTransport,
+};
 use p9fuse::{fuse9p, mount9p};
 use std::path::{Path, PathBuf};
 
@@ -24,7 +27,8 @@ enum Cmd {
     /// kernel modules). Prefer `mount9p-fuse` where privilege isn't available.
     #[command(name = "mount9p")]
     Mount9p {
-        /// Server URL: tcp://host:port, unix:///path, or ws://.../wss://... (`--connect-ws` alias).
+        /// Server URL: tcp://host:port, unix:///path, ws://.../wss://... (`--connect-ws` alias),
+        /// or fd://N for an already-connected socket on that file descriptor.
         #[arg(long, alias = "connect-ws")]
         connect: String,
         /// Extra websocket handshake header(s), "Name: Value" (e.g. an auth token). Repeatable.
@@ -49,7 +53,8 @@ enum Cmd {
     /// `chmod` works.
     #[command(name = "mount9p-fuse")]
     Mount9pFuse {
-        /// Server URL: tcp://host:port, unix:///path, or ws://.../wss://... (`--connect-ws` alias).
+        /// Server URL: tcp://host:port, unix:///path, ws://.../wss://... (`--connect-ws` alias),
+        /// or fd://N for an already-connected socket on that file descriptor.
         #[arg(long, alias = "connect-ws")]
         connect: String,
         /// Extra websocket handshake header(s), "Name: Value" (e.g. an auth token). Repeatable.
@@ -231,9 +236,13 @@ async fn build_transport(
         Ok(Box::new(
             WebSocketTransport::connect(connect, headers).await?,
         ))
+    } else if let Some(fd) = connect.strip_prefix("fd://") {
+        // No retry: the fd is either a connected socket or it isn't -- there's nothing to wait for.
+        let fd: std::os::unix::io::RawFd = fd.parse()?;
+        Ok(Box::new(unsafe { FdTransport::from_raw_fd(fd)? }))
     } else {
         Err(format!(
-            "unsupported --connect {connect:?}: use tcp://host:port, unix:///path, or ws://.../wss://..."
+            "unsupported --connect {connect:?}: use tcp://host:port, unix:///path, ws://.../wss://..., or fd://N"
         )
         .into())
     }
