@@ -50,5 +50,16 @@ pub async fn mount(
     aname: &str,
     tuning: Tuning,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    Fuse9p::run(transport, mountpoint, msize, uid, aname, tuning, true, true).await
+    Fuse9p::run(
+        transport,
+        mountpoint,
+        msize,
+        uid,
+        aname,
+        tuning,
+        true,
+        true,
+        std::time::Duration::from_secs(30),
+    )
+    .await
 }

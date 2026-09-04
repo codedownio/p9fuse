@@ -111,6 +111,11 @@ enum Cmd {
         /// Let the kernel enforce permissions against the owner/mode the 9p server reports.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         default_permissions: bool,
+        /// Seconds an outstanding 9p request may go unanswered before the daemon gives up and exits
+        /// (so a supervisor can remount). Without this a wedged server or silently dead tunnel hangs
+        /// every process touching the mount. 0 disables the watchdog.
+        #[arg(long, default_value_t = 30)]
+        stall_timeout: u64,
 
         mountpoint: PathBuf,
     },
@@ -164,6 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             wb_depth,
             detach_on_transport_loss,
             default_permissions,
+            stall_timeout,
             mountpoint,
         } => {
             let transport = build_transport(&connect, &parse_headers(&headers)?).await?;
@@ -185,6 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tuning,
                 detach_on_transport_loss,
                 default_permissions,
+                std::time::Duration::from_secs(stall_timeout),
             )
             .await
         }
