@@ -37,6 +37,8 @@ pub const TVERSION: u8 = 100;
 pub const RVERSION: u8 = 101;
 pub const TATTACH: u8 = 104;
 pub const RATTACH: u8 = 105;
+pub const TFLUSH: u8 = 108;
+pub const RFLUSH: u8 = 109;
 pub const TWALK: u8 = 110;
 pub const RWALK: u8 = 111;
 pub const TREAD: u8 = 116;
@@ -45,6 +47,32 @@ pub const TWRITE: u8 = 118;
 pub const RWRITE: u8 = 119;
 pub const TCLUNK: u8 = 120;
 pub const RCLUNK: u8 = 121;
+
+/// Human-readable name for a T-message type, for diagnostics.
+pub fn tmsg_name(t: u8) -> &'static str {
+    match t {
+        TSTATFS => "Tstatfs",
+        TLOPEN => "Tlopen",
+        TLCREATE => "Tlcreate",
+        TSYMLINK => "Tsymlink",
+        TREADLINK => "Treadlink",
+        TGETATTR => "Tgetattr",
+        TSETATTR => "Tsetattr",
+        TREADDIR => "Treaddir",
+        TFSYNC => "Tfsync",
+        TMKDIR => "Tmkdir",
+        TRENAMEAT => "Trenameat",
+        TUNLINKAT => "Tunlinkat",
+        TVERSION => "Tversion",
+        TATTACH => "Tattach",
+        TFLUSH => "Tflush",
+        TWALK => "Twalk",
+        TREAD => "Tread",
+        TWRITE => "Twrite",
+        TCLUNK => "Tclunk",
+        _ => "T?",
+    }
+}
 
 // Tsetattr `valid` bitmask.
 pub const SETATTR_MODE: u32 = 0x0001;
