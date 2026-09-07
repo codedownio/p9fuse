@@ -289,11 +289,15 @@ impl Fuse9p {
         detach_on_transport_loss: bool,
         // Whether to mount with `default_permissions`.
         default_permissions: bool,
+        // Give up on a 9p request unanswered for this long: the transport is declared dead, the
+        // mount exits, and the supervisor remounts. Zero disables the watchdog.
+        stall_timeout: std::time::Duration,
     ) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!(?tuning, "mount9p-fuse: tuning");
         // Attach as `uid` so the server acts as that user for file ops (a multiuser server like diod
         // setfsuids to it per attach), so files are owned by `uid` and chmod works.
-        let (client, root_qid) = NineClient::connect(transport, msize, uid, aname).await?;
+        let (client, root_qid) =
+            NineClient::connect(transport, msize, uid, aname, stall_timeout).await?;
         // Watch for the 9p transport closing: if it does, the mount is dead (every op would just
         // return EIO), so we exit below and let whatever supervises this process remount.
         let mut transport_gone = client.transport_gone();

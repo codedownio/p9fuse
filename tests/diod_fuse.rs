@@ -517,9 +517,15 @@ async fn client_rename_then_walk() {
     let gid = unsafe { libc::getegid() };
 
     let transport = Box::new(TcpTransport::connect(&addr).await.unwrap());
-    let (client, _root) = NineClient::connect(transport, 512_000, uid, &aname)
-        .await
-        .unwrap();
+    let (client, _root) = NineClient::connect(
+        transport,
+        512_000,
+        uid,
+        &aname,
+        std::time::Duration::from_secs(0),
+    )
+    .await
+    .unwrap();
     let root = client.root_fid;
 
     // Create "a.txt" (lcreate opens `dfid` on the new file, so clone root into a scratch fid first).

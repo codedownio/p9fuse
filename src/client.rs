@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 const NOTAG: u16 = 0xffff;
@@ -25,9 +26,17 @@ struct Frame {
     body: Vec<u8>,
 }
 
+/// A request that has been written to the transport and is waiting for its reply.
+struct PendingReq {
+    tx: oneshot::Sender<Frame>,
+    /// T-message type, so a stuck request can be named when the stall watchdog fires.
+    mtype: u8,
+    sent_at: Instant,
+}
+
 pub struct NineClient {
     sink: tokio::sync::Mutex<ByteSink>,
-    pending: Mutex<HashMap<u16, oneshot::Sender<Frame>>>,
+    pending: Mutex<HashMap<u16, PendingReq>>,
     next_tag: AtomicU16,
     next_fid: AtomicU32,
     pub msize: u32,
@@ -50,6 +59,7 @@ impl NineClient {
         msize: u32,
         n_uname: u32,
         aname: &str,
+        stall_timeout: Duration,
     ) -> Result<(Arc<NineClient>, Qid), Box<dyn std::error::Error>> {
         let (sink, mut stream) = transport.split();
 
@@ -86,6 +96,42 @@ impl NineClient {
             let _ = pump.transport_gone.send(true);
         });
 
+        // Stall watchdog: a reply that never arrives -- a silently dead tunnel, or a server wedged
+        // on its backing store -- would otherwise hang its waiter (and with it the serial FUSE
+        // session loop) forever with no other symptom. Declare the transport dead instead, which
+        // fails all waiters and makes the mount exit so its supervisor can remount.
+        if !stall_timeout.is_zero() {
+            let watch = client.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    ticker.tick().await;
+                    if *watch.transport_gone.subscribe().borrow() {
+                        return;
+                    }
+                    let oldest = {
+                        let map = watch.pending.lock().unwrap();
+                        map.iter()
+                            .map(|(tag, p)| (*tag, p.mtype, p.sent_at.elapsed()))
+                            .max_by_key(|(_, _, age)| *age)
+                    };
+                    if let Some((tag, mtype, age)) = oldest {
+                        if age > stall_timeout {
+                            tracing::error!(
+                                tag,
+                                mtype = tmsg_name(mtype),
+                                age_secs = age.as_secs(),
+                                "9p request stalled; declaring the transport dead"
+                            );
+                            watch.pending.lock().unwrap().clear();
+                            let _ = watch.transport_gone.send(true);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+
         // Version handshake (tag NOTAG), then attach.
         let negotiated = client.version(msize).await?;
         // Re-stamp msize is immutable on the struct; we only ever send <= negotiated, and our reads
@@ -111,8 +157,8 @@ impl NineClient {
             typ: frame.typ,
             body: frame.body[2..].to_vec(),
         };
-        if let Some(tx) = self.pending.lock().unwrap().remove(&tag) {
-            let _ = tx.send(payload);
+        if let Some(p) = self.pending.lock().unwrap().remove(&tag) {
+            let _ = p.tx.send(payload);
         }
     }
 
@@ -133,7 +179,14 @@ impl NineClient {
     /// transport/protocol failure (mapped to EIO).
     async fn transact(&self, mtype: u8, tag: u16, body: &[u8]) -> Result<Frame, i32> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(tag, tx);
+        self.pending.lock().unwrap().insert(
+            tag,
+            PendingReq {
+                tx,
+                mtype,
+                sent_at: Instant::now(),
+            },
+        );
 
         let size = (4 + 1 + 2 + body.len()) as u32;
         let mut frame = Vec::with_capacity(size as usize);
