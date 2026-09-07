@@ -524,8 +524,8 @@ async fn client_rename_then_walk() {
         &aname,
         std::time::Duration::from_secs(0),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     let root = client.root_fid;
 
     // Create "a.txt" (lcreate opens `dfid` on the new file, so clone root into a scratch fid first).
