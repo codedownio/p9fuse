@@ -78,21 +78,51 @@ impl NineClient {
         let pump = client.clone();
         tokio::spawn(async move {
             let mut acc: Vec<u8> = Vec::with_capacity(1 << 16);
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(chunk) => {
+            let reason;
+            loop {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
                         acc.extend_from_slice(&chunk);
                         while let Some(frame) = take_frame(&mut acc) {
                             pump.dispatch(frame);
                         }
                     }
                     // Transport error: stop pumping; the cleanup below fails all waiters.
-                    Err(_) => break,
+                    Some(Err(e)) => {
+                        reason = format!("transport error: {e}");
+                        break;
+                    }
+                    // Clean end of stream: the peer closed, or the tunnel was shut down.
+                    None => {
+                        reason = "peer closed the stream".to_string();
+                        break;
+                    }
                 }
             }
             // Transport gone: drop all waiters so their requests fail instead of hanging, and signal
             // the mount to exit so a dead mount is torn down and remounted rather than serving EIO.
-            pump.pending.lock().unwrap().clear();
+            // Log first: every in-flight request is about to fail with EIO, and without the reason
+            // here the only visible symptom is an unexplained EIO in whatever was reading.
+            {
+                let mut map = pump.pending.lock().unwrap();
+                let waiting: Vec<String> = map
+                    .iter()
+                    .map(|(tag, p)| {
+                        format!("{}({}, {:?})", tmsg_name(p.mtype), tag, p.sent_at.elapsed())
+                    })
+                    .collect();
+                map.clear();
+                if waiting.is_empty() {
+                    tracing::warn!(reason = %reason, "9p transport gone (no requests in flight)");
+                } else {
+                    tracing::error!(
+                        reason = %reason,
+                        inflight = waiting.len(),
+                        requests = %waiting.join(", "),
+                        "9p transport gone; failing in-flight requests with EIO"
+                    );
+                }
+            }
             let _ = pump.transport_gone.send(true);
         });
 
