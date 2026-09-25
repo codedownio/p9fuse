@@ -225,13 +225,19 @@ impl NineClient {
         }
     }
 
-    fn alloc_tag(&self) -> u16 {
-        loop {
+    /// Allocate a tag that is not already in flight, or `None` if every tag is. The tag space is 16
+    /// bits, so the counter wraps after 65535 requests; a request still awaiting its reply when its
+    /// tag comes round again would be displaced from `pending`, dropping its waiter and failing it
+    /// with EIO over a perfectly healthy connection. Skipping live tags makes that unrepresentable.
+    fn alloc_tag(&self) -> Option<u16> {
+        let map = self.pending.lock().unwrap();
+        for _ in 0..=u16::MAX {
             let t = self.next_tag.fetch_add(1, Ordering::Relaxed);
-            if t != NOTAG {
-                return t;
+            if t != NOTAG && !map.contains_key(&t) {
+                return Some(t);
             }
         }
+        None
     }
 
     pub fn alloc_fid(&self) -> u32 {
@@ -242,7 +248,7 @@ impl NineClient {
     /// transport/protocol failure (mapped to EIO).
     async fn transact(&self, mtype: u8, tag: u16, body: &[u8]) -> Result<Frame, i32> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(
+        let displaced = self.pending.lock().unwrap().insert(
             tag,
             PendingReq {
                 tx,
@@ -250,6 +256,18 @@ impl NineClient {
                 sent_at: Instant::now(),
             },
         );
+        // Dropping the displaced entry drops its waiter's sender, failing that request with EIO and
+        // hiding it from the stall watchdog (which only sees what is still in `pending`). `alloc_tag`
+        // makes this unreachable; say so loudly rather than silently if it ever happens again.
+        if let Some(old) = displaced {
+            tracing::error!(
+                tag,
+                op = tmsg_name(mtype),
+                displaced_op = tmsg_name(old.mtype),
+                displaced_age_secs = old.sent_at.elapsed().as_secs(),
+                "9p: tag collision; the displaced request will fail with EIO"
+            );
+        }
 
         let size = (4 + 1 + 2 + body.len()) as u32;
         let mut frame = Vec::with_capacity(size as usize);
@@ -308,7 +326,13 @@ impl NineClient {
 
     /// Like `transact` but checks the response type and returns just the body.
     async fn req(&self, mtype: u8, expect: u8, body: &[u8]) -> Result<Vec<u8>, i32> {
-        let tag = self.alloc_tag();
+        let Some(tag) = self.alloc_tag() else {
+            tracing::error!(
+                op = tmsg_name(mtype),
+                "9p: every tag is in flight; cannot issue the request"
+            );
+            return Err(libc::EIO);
+        };
         let r = self.transact(mtype, tag, body).await?;
         if r.typ != expect {
             tracing::error!(
