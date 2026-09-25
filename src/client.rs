@@ -20,6 +20,39 @@ use tokio::sync::oneshot;
 const NOTAG: u16 = 0xffff;
 const ROOT_FID: u32 = 1;
 
+/// Errnos that are part of normal filesystem operation and not worth a log line. Anything else is:
+/// the mount hands the errno to the application unchanged, so an unexplained EIO surfacing in a
+/// process on the mount is otherwise indistinguishable from a transport failure.
+fn benign_errno(e: i32) -> bool {
+    matches!(
+        e,
+        libc::ENOENT
+            | libc::EEXIST
+            | libc::ENOTEMPTY
+            | libc::ENOTDIR
+            | libc::EISDIR
+            | libc::EACCES
+            | libc::EPERM
+            | libc::EAGAIN
+            | libc::EINVAL
+            | libc::ENODATA
+            | libc::ERANGE
+            | libc::EOPNOTSUPP
+            | libc::EXDEV
+    )
+}
+
+/// The fid a T-message acts on. Every 9p2000.L T-message we send except Tversion opens its body
+/// with one.
+fn body_fid(mtype: u8, body: &[u8]) -> Option<u32> {
+    match mtype {
+        TVERSION => None,
+        _ => body
+            .get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+    }
+}
+
 /// A decoded response frame: message type plus the body after the 7-byte header.
 struct Frame {
     typ: u8,
@@ -229,6 +262,13 @@ impl NineClient {
             let mut sink = self.sink.lock().await;
             if sink.send(frame).await.is_err() {
                 self.pending.lock().unwrap().remove(&tag);
+                tracing::error!(
+                    op = tmsg_name(mtype),
+                    tag,
+                    fid = ?body_fid(mtype, body),
+                    origin = "local: transport sink refused the send",
+                    "9p: request failed with EIO"
+                );
                 return Err(libc::EIO);
             }
         }
@@ -237,12 +277,32 @@ impl NineClient {
             Ok(resp) => {
                 if resp.typ == RLERROR {
                     let ecode = R::new(&resp.body).u32().unwrap_or(libc::EIO as u32);
-                    Err(ecode as i32)
+                    let e = ecode as i32;
+                    if !benign_errno(e) {
+                        tracing::error!(
+                            op = tmsg_name(mtype),
+                            tag,
+                            fid = ?body_fid(mtype, body),
+                            errno = e,
+                            origin = "server: Rlerror",
+                            "9p: request failed"
+                        );
+                    }
+                    Err(e)
                 } else {
                     Ok(resp)
                 }
             }
-            Err(_) => Err(libc::EIO), // transport dropped the waiter
+            Err(_) => {
+                tracing::error!(
+                    op = tmsg_name(mtype),
+                    tag,
+                    fid = ?body_fid(mtype, body),
+                    origin = "local: waiter dropped before a reply arrived",
+                    "9p: request failed with EIO"
+                );
+                Err(libc::EIO)
+            }
         }
     }
 
@@ -251,7 +311,15 @@ impl NineClient {
         let tag = self.alloc_tag();
         let r = self.transact(mtype, tag, body).await?;
         if r.typ != expect {
-            tracing::warn!(got = r.typ, want = expect, "9p: unexpected response type");
+            tracing::error!(
+                op = tmsg_name(mtype),
+                tag,
+                fid = ?body_fid(mtype, body),
+                got = r.typ,
+                want = expect,
+                origin = "local: unexpected response type",
+                "9p: request failed with EIO"
+            );
             return Err(libc::EIO);
         }
         Ok(r.body)

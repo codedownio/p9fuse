@@ -163,7 +163,13 @@ impl Fuse9p {
                 .acquire_many(depth)
                 .await
                 .expect("write-back semaphore closed");
-            wb.err.lock().unwrap().take()
+            let err = wb.err.lock().unwrap().take();
+            if let Some(e) = err {
+                // The failing Twrite logged itself when it happened; this says where the error
+                // finally reached the application, which is a flush/fsync/release much later.
+                tracing::error!(errno = e, "9p: surfacing a deferred write-back error");
+            }
+            err
         })
     }
 }
@@ -205,6 +211,14 @@ async fn write_all(
         let end = (pos + chunk.max(1)).min(data.len());
         let n = client.write(fid, o, &data[pos..end]).await?;
         if n == 0 {
+            tracing::error!(
+                fid,
+                offset = o,
+                asked = end - pos,
+                remaining = data.len() - pos,
+                origin = "local: server accepted 0 bytes of a Twrite",
+                "9p: write failed with EIO"
+            );
             return Err(libc::EIO);
         }
         pos += n as usize;
