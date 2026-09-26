@@ -20,28 +20,6 @@ use tokio::sync::oneshot;
 const NOTAG: u16 = 0xffff;
 const ROOT_FID: u32 = 1;
 
-/// Errnos that are part of normal filesystem operation and not worth a log line. Anything else is:
-/// the mount hands the errno to the application unchanged, so an unexplained EIO surfacing in a
-/// process on the mount is otherwise indistinguishable from a transport failure.
-fn benign_errno(e: i32) -> bool {
-    matches!(
-        e,
-        libc::ENOENT
-            | libc::EEXIST
-            | libc::ENOTEMPTY
-            | libc::ENOTDIR
-            | libc::EISDIR
-            | libc::EACCES
-            | libc::EPERM
-            | libc::EAGAIN
-            | libc::EINVAL
-            | libc::ENODATA
-            | libc::ERANGE
-            | libc::EOPNOTSUPP
-            | libc::EXDEV
-    )
-}
-
 /// The fid a T-message acts on. Every 9p2000.L T-message we send except Tversion opens its body
 /// with one.
 fn body_fid(mtype: u8, body: &[u8]) -> Option<u32> {
@@ -296,12 +274,12 @@ impl NineClient {
                 if resp.typ == RLERROR {
                     let ecode = R::new(&resp.body).u32().unwrap_or(libc::EIO as u32);
                     let e = ecode as i32;
-                    // Data-path ops log whatever errno they got. The benign list exists to keep
-                    // ordinary lookup misses quiet, but a reader reaching one of these is how an
-                    // errno becomes an application error -- SQLite turns several of the "benign"
-                    // ones into a disk I/O error -- so filtering here would hide the cause.
-                    let data_path = matches!(mtype, TREAD | TWRITE | TFSYNC | TGETATTR | TSETATTR);
-                    if data_path || !benign_errno(e) {
+                    // Diagnostic build: log every errno on every op, including the ones the
+                    // benign list would drop. An application error can come from any of them --
+                    // SQLite turns several "ordinary" errnos into a disk I/O error, and the op
+                    // that produced it is what is being hunted -- so any filter here can hide the
+                    // cause. Noisier than is reasonable for a release build; that is the trade.
+                    {
                         tracing::error!(
                             op = tmsg_name(mtype),
                             tag,
