@@ -389,6 +389,13 @@ impl NineClient {
 
     /// Walk `names` from `fid` into the fresh `newfid`. `names` empty clones the fid (newfid points
     /// at the same file). Returns the walked qids (one per name).
+    /// Walk `names` from `fid` to `newfid`.
+    ///
+    /// On `Ok`, `newfid` is established on the server and belongs to the caller, who must clunk it
+    /// when done. On `Err` it is not, and clunking it is a protocol error the server answers with
+    /// EIO: 9P2000 leaves `newfid` untouched unless the walk completes in full. A server reports a
+    /// name that did not resolve by returning fewer qids than asked for rather than an Rlerror, so
+    /// that short reply is mapped to ENOENT here to keep the rule "Err means no fid" exact.
     pub async fn walk(&self, fid: u32, newfid: u32, names: &[&str]) -> Result<Vec<Qid>, i32> {
         let mut w = W::new();
         w.u32(fid).u32(newfid).u16(names.len() as u16);
@@ -398,6 +405,9 @@ impl NineClient {
         let body = self.req(TWALK, RWALK, &w.buf).await?;
         let mut r = R::new(&body);
         let nq = r.u16().ok_or(libc::EIO)? as usize;
+        if nq < names.len() {
+            return Err(libc::ENOENT);
+        }
         let mut out = Vec::with_capacity(nq);
         for _ in 0..nq {
             out.push(r.qid().ok_or(libc::EIO)?);
