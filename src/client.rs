@@ -296,7 +296,12 @@ impl NineClient {
                 if resp.typ == RLERROR {
                     let ecode = R::new(&resp.body).u32().unwrap_or(libc::EIO as u32);
                     let e = ecode as i32;
-                    if !benign_errno(e) {
+                    // Data-path ops log whatever errno they got. The benign list exists to keep
+                    // ordinary lookup misses quiet, but a reader reaching one of these is how an
+                    // errno becomes an application error -- SQLite turns several of the "benign"
+                    // ones into a disk I/O error -- so filtering here would hide the cause.
+                    let data_path = matches!(mtype, TREAD | TWRITE | TFSYNC | TGETATTR | TSETATTR);
+                    if data_path || !benign_errno(e) {
                         tracing::error!(
                             op = tmsg_name(mtype),
                             tag,
