@@ -192,6 +192,29 @@ fn negative_attr() -> FileAttr {
 
 /// Write `data` to `fid` starting at byte `off`, split into `chunk`-sized `Twrite`s. A short write of
 /// 0 is treated as an error so callers don't spin.
+/// Diagnostic build only: read exactly as the unpatched client does -- returning a short Tread
+/// reply straight through -- but first establish whether the reply was short *mid-file* by probing
+/// one byte past it. A short reply at end of file is ordinary; one with data behind it is the bug
+/// being hunted, and it is otherwise invisible because nothing fails. The probe's result is
+/// discarded so the truncating behaviour is preserved exactly.
+async fn read_probing(client: &NineClient, fid: u32, off: u64, cap: u32) -> Result<Vec<u8>, i32> {
+    let data = client.read(fid, off, cap).await?;
+    let got = data.len() as u32;
+    if got > 0 && got < cap {
+        let probe = client.read(fid, off + got as u64, 1).await?;
+        if !probe.is_empty() {
+            tracing::warn!(
+                fid,
+                offset = off,
+                asked = cap,
+                got,
+                "9p: short Tread reply with data behind it"
+            );
+        }
+    }
+    Ok(data)
+}
+
 async fn write_all(
     client: &NineClient,
     fid: u32,
@@ -707,7 +730,7 @@ impl Filesystem for Fuse9p {
         let cap = size.min(self.client.msize.saturating_sub(24));
         match self
             .rt
-            .block_on(async move { client.read(fid, offset as u64, cap).await })
+            .block_on(async move { read_probing(&client, fid, offset as u64, cap).await })
         {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(e),
