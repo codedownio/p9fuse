@@ -433,8 +433,8 @@ async fn invalidation_loop(
                 let pqp = qids.last().map(|q| q.path).unwrap_or(root_qid_path);
                 Some(qid_to_ino(pqp, root_qid_path))
             }
+            // The walk did not establish pf, so there is nothing to clunk.
             Err(e) => {
-                let _ = client.clunk(pf).await;
                 tracing::warn!(rel, ?e, "mount9p-fuse: invalidation parent walk failed");
                 None
             }
@@ -461,8 +461,9 @@ async fn invalidation_loop(
                     tracing::info!(rel, ino, result = ?r, "mount9p-fuse: inval_inode");
                 }
             }
+            // The walk did not establish cf, so there is nothing to clunk. This is the common case:
+            // an invalidation for a deleted or renamed path no longer resolves.
             Err(e) => {
-                let _ = client.clunk(cf).await;
                 tracing::warn!(rel, ?e, "mount9p-fuse: invalidation child walk failed");
             }
         }
@@ -507,16 +508,20 @@ impl Filesystem for Fuse9p {
         let name = name.to_string_lossy().to_string();
         let newfid = self.client.alloc_fid();
         let client = self.client.clone();
+        // Walk first, and only own (and so only clunk) newfid once the walk has established it.
         let res = self.rt.block_on(async move {
             client.walk(parent_fid, newfid, &[&name]).await?;
-            let a = client.getattr(newfid).await?;
-            Ok::<Attr, i32>(a)
+            match client.getattr(newfid).await {
+                Ok(a) => Ok(a),
+                // The fid exists but we are not returning it, so release it.
+                Err(e) => {
+                    let _ = client.clunk(newfid).await;
+                    Err(e)
+                }
+            }
         });
         match res {
             Err(e) => {
-                // The walk may have partially succeeded then failed; clunk defensively.
-                let c = self.client.clone();
-                let _ = self.rt.block_on(async move { c.clunk(newfid).await });
                 // Negative-dentry caching: tell the kernel to remember this miss for a while so
                 // repeated probes of the same absent path don't each round-trip.
                 match (e, self.tuning.negative_ttl) {
@@ -661,9 +666,16 @@ impl Filesystem for Fuse9p {
         }
         let client = self.client.clone();
         let res = self.rt.block_on(async move {
-            client.walk(base, newfid, &[]).await?; // clone the base fid
-            client.lopen(newfid, oflags).await?;
-            Ok::<(), i32>(())
+            // Clone the base fid. newfid exists only once this succeeds, so the open failing below
+            // is the only case that has to release it.
+            client.walk(base, newfid, &[]).await?;
+            match client.lopen(newfid, oflags).await {
+                Ok(_) => Ok::<(), i32>(()),
+                Err(e) => {
+                    let _ = client.clunk(newfid).await;
+                    Err(e)
+                }
+            }
         });
         match res {
             Ok(()) => {
@@ -672,11 +684,7 @@ impl Filesystem for Fuse9p {
                 let fh = self.insert_handle(newfid, writable);
                 reply.opened(fh, 0);
             }
-            Err(e) => {
-                let c = self.client.clone();
-                let _ = self.rt.block_on(async move { c.clunk(newfid).await });
-                reply.error(e);
-            }
+            Err(e) => reply.error(e),
         }
     }
 
@@ -801,20 +809,24 @@ impl Filesystem for Fuse9p {
         let newfid = self.client.alloc_fid();
         let client = self.client.clone();
         let res = self.rt.block_on(async move {
-            client.walk(base, newfid, &[]).await?; // clone
-            client.lopen(newfid, 0).await?; // O_RDONLY; diod allows readdir on it
-            Ok::<(), i32>(())
+            // Clone the base fid. newfid exists only once this succeeds, so the open failing below
+            // is the only case that has to release it.
+            client.walk(base, newfid, &[]).await?;
+            // O_RDONLY; diod allows readdir on it.
+            match client.lopen(newfid, 0).await {
+                Ok(_) => Ok::<(), i32>(()),
+                Err(e) => {
+                    let _ = client.clunk(newfid).await;
+                    Err(e)
+                }
+            }
         });
         match res {
             Ok(()) => {
                 let fh = self.insert_handle(newfid, false);
                 reply.opened(fh, 0);
             }
-            Err(e) => {
-                let c = self.client.clone();
-                let _ = self.rt.block_on(async move { c.clunk(newfid).await });
-                reply.error(e);
-            }
+            Err(e) => reply.error(e),
         }
     }
 
@@ -985,15 +997,29 @@ impl Filesystem for Fuse9p {
         let oflags = (flags as u32) & !(libc::O_CLOEXEC as u32);
         let client = self.client.clone();
         let res = self.rt.block_on(async move {
-            // Clone the parent into openfid and create+open the new file through it.
+            // Clone the parent into openfid and create+open the new file through it. Each step
+            // releases only the fids the server has actually established by that point.
             client.walk(parent_fid, openfid, &[]).await?;
-            client
+            if let Err(e) = client
                 .lcreate(openfid, &name, oflags, mode & 0o7777, gid)
-                .await?;
+                .await
+            {
+                let _ = client.clunk(openfid).await;
+                return Err(e);
+            }
             // Separately walk a base fid to the new entry for the inode table + attrs.
-            client.walk(parent_fid, basefid, &[&name]).await?;
-            let a = client.getattr(basefid).await?;
-            Ok::<Attr, i32>(a)
+            if let Err(e) = client.walk(parent_fid, basefid, &[&name]).await {
+                let _ = client.clunk(openfid).await;
+                return Err(e);
+            }
+            match client.getattr(basefid).await {
+                Ok(a) => Ok(a),
+                Err(e) => {
+                    let _ = client.clunk(openfid).await;
+                    let _ = client.clunk(basefid).await;
+                    Err(e)
+                }
+            }
         });
         match res {
             Ok(attr) => {
@@ -1009,14 +1035,7 @@ impl Filesystem for Fuse9p {
                 let fh = self.insert_handle(openfid, true);
                 reply.created(&self.tuning.entry_ttl, &to_fileattr(ino, &attr), 0, fh, 0);
             }
-            Err(e) => {
-                let c = self.client.clone();
-                self.rt.block_on(async move {
-                    let _ = c.clunk(openfid).await;
-                    let _ = c.clunk(basefid).await;
-                });
-                reply.error(e);
-            }
+            Err(e) => reply.error(e),
         }
     }
 
@@ -1040,8 +1059,14 @@ impl Filesystem for Fuse9p {
         let res = self.rt.block_on(async move {
             client.mkdir(parent_fid, &name, mode & 0o7777, gid).await?;
             client.walk(parent_fid, basefid, &[&name]).await?;
-            let a = client.getattr(basefid).await?;
-            Ok::<Attr, i32>(a)
+            // basefid exists from here on; release it if the getattr fails.
+            match client.getattr(basefid).await {
+                Ok(a) => Ok::<Attr, i32>(a),
+                Err(e) => {
+                    let _ = client.clunk(basefid).await;
+                    Err(e)
+                }
+            }
         });
         match res {
             Ok(attr) => {
@@ -1055,11 +1080,7 @@ impl Filesystem for Fuse9p {
                 );
                 reply.entry(&self.tuning.entry_ttl, &to_fileattr(ino, &attr), 0);
             }
-            Err(e) => {
-                let c = self.client.clone();
-                let _ = self.rt.block_on(async move { c.clunk(basefid).await });
-                reply.error(e);
-            }
+            Err(e) => reply.error(e),
         }
     }
 
@@ -1137,22 +1158,24 @@ impl Filesystem for Fuse9p {
         let client = self.client.clone();
         let walked = self.rt.block_on(async move {
             let qids = client.walk(npfid, freshfid, &[&newname]).await?;
-            qids.last().map(|q| q.path).ok_or(libc::EIO)
-        });
-        match walked {
-            Ok(qid_path) => {
-                let ino = self.intern(qid_path);
-                if let Some(inode) = self.inodes.get_mut(&ino) {
-                    let stale = std::mem::replace(&mut inode.fid, freshfid);
-                    let c = self.client.clone();
-                    let _ = self.rt.block_on(async move { c.clunk(stale).await });
-                } else {
-                    // Not tracked (never looked up / already forgotten): nothing to repair.
-                    let c = self.client.clone();
-                    let _ = self.rt.block_on(async move { c.clunk(freshfid).await });
+            // The walk established freshfid; release it if the reply carried no qid to use.
+            match qids.last().map(|q| q.path) {
+                Some(p) => Ok(p),
+                None => {
+                    let _ = client.clunk(freshfid).await;
+                    Err(libc::EIO)
                 }
             }
-            Err(_) => {
+        });
+        // A failed walk did not establish freshfid, so that case has nothing to clunk.
+        if let Ok(qid_path) = walked {
+            let ino = self.intern(qid_path);
+            if let Some(inode) = self.inodes.get_mut(&ino) {
+                let stale = std::mem::replace(&mut inode.fid, freshfid);
+                let c = self.client.clone();
+                let _ = self.rt.block_on(async move { c.clunk(stale).await });
+            } else {
+                // Not tracked (never looked up / already forgotten): nothing to repair.
                 let c = self.client.clone();
                 let _ = self.rt.block_on(async move { c.clunk(freshfid).await });
             }
@@ -1180,8 +1203,14 @@ impl Filesystem for Fuse9p {
         let res = self.rt.block_on(async move {
             client.symlink(parent_fid, &name, &target, gid).await?;
             client.walk(parent_fid, basefid, &[&name]).await?;
-            let a = client.getattr(basefid).await?;
-            Ok::<Attr, i32>(a)
+            // basefid exists from here on; release it if the getattr fails.
+            match client.getattr(basefid).await {
+                Ok(a) => Ok::<Attr, i32>(a),
+                Err(e) => {
+                    let _ = client.clunk(basefid).await;
+                    Err(e)
+                }
+            }
         });
         match res {
             Ok(attr) => {
@@ -1195,11 +1224,7 @@ impl Filesystem for Fuse9p {
                 );
                 reply.entry(&self.tuning.entry_ttl, &to_fileattr(ino, &attr), 0);
             }
-            Err(e) => {
-                let c = self.client.clone();
-                let _ = self.rt.block_on(async move { c.clunk(basefid).await });
-                reply.error(e);
-            }
+            Err(e) => reply.error(e),
         }
     }
 
