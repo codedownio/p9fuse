@@ -192,6 +192,27 @@ fn negative_attr() -> FileAttr {
 
 /// Write `data` to `fid` starting at byte `off`, split into `chunk`-sized `Twrite`s. A short write of
 /// 0 is treated as an error so callers don't spin.
+/// Read up to `cap` bytes at `off`, reassembling short replies.
+///
+/// A 9p server may answer a Tread with fewer bytes than asked for even mid-file -- a short `pread`
+/// on its backing store is enough -- and only a zero-length reply means end of file. Returning a
+/// short reply straight to FUSE would present it to the application as a short file: a reader that
+/// treats that as corruption (SQLite raises SQLITE_IOERR_SHORT_READ, surfaced as "disk I/O error")
+/// then fails with no error recorded anywhere, because nothing actually failed.
+async fn read_full(client: &NineClient, fid: u32, off: u64, cap: u32) -> Result<Vec<u8>, i32> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut pos = off;
+    while (out.len() as u32) < cap {
+        let chunk = client.read(fid, pos, cap - out.len() as u32).await?;
+        if chunk.is_empty() {
+            break; // end of file
+        }
+        pos += chunk.len() as u64;
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 async fn write_all(
     client: &NineClient,
     fid: u32,
@@ -707,7 +728,7 @@ impl Filesystem for Fuse9p {
         let cap = size.min(self.client.msize.saturating_sub(24));
         match self
             .rt
-            .block_on(async move { client.read(fid, offset as u64, cap).await })
+            .block_on(async move { read_full(&client, fid, offset as u64, cap).await })
         {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(e),
