@@ -666,8 +666,9 @@ impl Filesystem for Fuse9p {
         }
         let client = self.client.clone();
         let res = self.rt.block_on(async move {
-            client.walk(base, newfid, &[]).await?; // clone the base fid
-            // newfid exists from here on; release it if the open fails.
+            // Clone the base fid. newfid exists only once this succeeds, so the open failing below
+            // is the only case that has to release it.
+            client.walk(base, newfid, &[]).await?;
             match client.lopen(newfid, oflags).await {
                 Ok(_) => Ok::<(), i32>(()),
                 Err(e) => {
@@ -808,10 +809,11 @@ impl Filesystem for Fuse9p {
         let newfid = self.client.alloc_fid();
         let client = self.client.clone();
         let res = self.rt.block_on(async move {
-            client.walk(base, newfid, &[]).await?; // clone
-            // newfid exists from here on; release it if the open fails.
+            // Clone the base fid. newfid exists only once this succeeds, so the open failing below
+            // is the only case that has to release it.
+            client.walk(base, newfid, &[]).await?;
+            // O_RDONLY; diod allows readdir on it.
             match client.lopen(newfid, 0).await {
-                // O_RDONLY; diod allows readdir on it
                 Ok(_) => Ok::<(), i32>(()),
                 Err(e) => {
                     let _ = client.clunk(newfid).await;
@@ -1165,21 +1167,18 @@ impl Filesystem for Fuse9p {
                 }
             }
         });
-        match walked {
-            Ok(qid_path) => {
-                let ino = self.intern(qid_path);
-                if let Some(inode) = self.inodes.get_mut(&ino) {
-                    let stale = std::mem::replace(&mut inode.fid, freshfid);
-                    let c = self.client.clone();
-                    let _ = self.rt.block_on(async move { c.clunk(stale).await });
-                } else {
-                    // Not tracked (never looked up / already forgotten): nothing to repair.
-                    let c = self.client.clone();
-                    let _ = self.rt.block_on(async move { c.clunk(freshfid).await });
-                }
+        // A failed walk did not establish freshfid, so that case has nothing to clunk.
+        if let Ok(qid_path) = walked {
+            let ino = self.intern(qid_path);
+            if let Some(inode) = self.inodes.get_mut(&ino) {
+                let stale = std::mem::replace(&mut inode.fid, freshfid);
+                let c = self.client.clone();
+                let _ = self.rt.block_on(async move { c.clunk(stale).await });
+            } else {
+                // Not tracked (never looked up / already forgotten): nothing to repair.
+                let c = self.client.clone();
+                let _ = self.rt.block_on(async move { c.clunk(freshfid).await });
             }
-            // The walk did not establish freshfid, so there is nothing to clunk.
-            Err(_) => {}
         }
         reply.ok();
     }
