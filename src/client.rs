@@ -246,6 +246,11 @@ impl NineClient {
         {
             let mut sink = self.sink.lock().await;
             if sink.send(frame).await.is_err() {
+                tracing::error!(
+                    tag,
+                    op = tmsg_name(mtype),
+                    "9p: transport send failed; failing the request with EIO"
+                );
                 self.pending.lock().unwrap().remove(&tag);
                 return Err(libc::EIO);
             }
@@ -260,7 +265,16 @@ impl NineClient {
                     Ok(resp)
                 }
             }
-            Err(_) => Err(libc::EIO), // transport dropped the waiter
+            Err(_) => {
+                // The reader task dropped this tag's sender without a reply: the transport went
+                // away, or something cleared `pending` out from under it.
+                tracing::error!(
+                    tag,
+                    op = tmsg_name(mtype),
+                    "9p: waiter dropped without a reply; failing the request with EIO"
+                );
+                Err(libc::EIO)
+            }
         }
     }
 
@@ -275,7 +289,15 @@ impl NineClient {
         };
         let r = self.transact(mtype, tag, body).await?;
         if r.typ != expect {
-            tracing::warn!(got = r.typ, want = expect, "9p: unexpected response type");
+            // Error, not warn: this returns EIO to whatever was reading, and the default filter
+            // drops warn, so at warn the application sees an EIO with nothing logged anywhere.
+            tracing::error!(
+                tag,
+                op = tmsg_name(mtype),
+                got = r.typ,
+                want = expect,
+                "9p: unexpected response type; failing the request with EIO"
+            );
             return Err(libc::EIO);
         }
         Ok(r.body)
