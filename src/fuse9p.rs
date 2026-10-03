@@ -722,7 +722,12 @@ impl Filesystem for Fuse9p {
     ) {
         let fid = match self.handles.get(&fh) {
             Some(h) => h.fid,
-            None => return reply.error(libc::EBADF),
+            None => {
+                // Error, not silence: every way this handler can fail reaches the application as a
+                // bare errno, so each one has to name itself or the failure is invisible.
+                tracing::error!(fh, offset, size, "fuse: read on an unknown handle; failing EBADF");
+                return reply.error(libc::EBADF);
+            }
         };
         let client = self.client.clone();
         let cap = size.min(self.client.msize.saturating_sub(24));
@@ -731,7 +736,10 @@ impl Filesystem for Fuse9p {
             .block_on(async move { read_full(&client, fid, offset as u64, cap).await })
         {
             Ok(data) => reply.data(&data),
-            Err(e) => reply.error(e),
+            Err(e) => {
+                tracing::error!(fh, fid, offset, size, cap, errno = e, "fuse: read failed");
+                reply.error(e)
+            }
         }
     }
 
