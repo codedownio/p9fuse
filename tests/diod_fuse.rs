@@ -360,7 +360,7 @@ where
 
     let tcp_addr = format!("127.0.0.1:{}", diod.port);
     let aname = diod.export().to_string_lossy().into_owned();
-    let uid = unsafe { libc::geteuid() };
+    let uid = nix::unistd::geteuid().as_raw();
 
     // Resolve the connect target, starting a relay to diod's TCP port for non-TCP transports.
     let reldir = tempfile::tempdir().unwrap();
@@ -614,8 +614,8 @@ async fn client_rename_then_walk() {
     let diod = Diod::start();
     let addr = format!("127.0.0.1:{}", diod.port);
     let aname = diod.export().to_string_lossy().into_owned();
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
+    let uid = nix::unistd::geteuid().as_raw();
+    let gid = nix::unistd::getegid().as_raw();
 
     let transport = Box::new(TcpTransport::connect(&addr).await.unwrap());
     let (client, _root) =
@@ -860,7 +860,9 @@ async fn statfs_reports_capacity() {
     }
     with_mount(Tuning::default(), |mp| {
         let cpath = std::ffi::CString::new(mp.to_str().unwrap()).unwrap();
+        // SAFETY: statvfs is a plain C struct, for which all zeroes is a valid value.
         let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `cpath` is NUL-terminated and `st` is a live statvfs.
         assert_eq!(unsafe { libc::statvfs(cpath.as_ptr(), &mut st) }, 0);
         assert!(st.f_bsize > 0, "block size should be non-zero");
         assert!(st.f_blocks > 0, "total blocks should be non-zero");

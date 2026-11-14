@@ -19,7 +19,7 @@ use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -150,8 +150,7 @@ pub async fn mount9p(
     // 3. Turn the bridge end into a tokio stream. We must start pumping BEFORE mount(2) returns:
     // the kernel performs the 9p version/attach handshake synchronously inside mount(), so if the
     // bridge weren't already forwarding, mount() would block forever waiting for the server.
-    let bridge_std =
-        unsafe { std::os::unix::net::UnixStream::from_raw_fd(sock_bridge.into_raw_fd()) };
+    let bridge_std = std::os::unix::net::UnixStream::from(sock_bridge);
     bridge_std.set_nonblocking(true)?;
     let bridge = tokio::net::UnixStream::from_std(bridge_std)?;
     let (mut bridge_rd, mut bridge_wr) = tokio::io::split(bridge);
