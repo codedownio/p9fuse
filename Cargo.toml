@@ -47,9 +47,13 @@ codegen-units = 1
 [lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }
 unused_qualifications = "warn"
+unsafe_op_in_unsafe_fn = "warn"
 
 [lints.clippy]
 # Silent integer truncation is the easiest way for 9p message encoding to go wrong.
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
 cast_possible_wrap = "warn"
+undocumented_unsafe_blocks = "warn"
+dbg_macro = "warn"
+todo = "warn"

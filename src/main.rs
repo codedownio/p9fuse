@@ -275,6 +275,7 @@ async fn build_transport(
     } else if let Some(fd) = connect.strip_prefix("fd://") {
         // No retry: the fd is either a connected socket or it isn't -- there's nothing to wait for.
         let fd: std::os::unix::io::RawFd = fd.parse()?;
+        // SAFETY: whoever started us passed this fd for us to own; nothing else here uses it.
         Ok(Box::new(unsafe { FdTransport::from_raw_fd(fd)? }))
     } else {
         Err(format!(

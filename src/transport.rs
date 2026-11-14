@@ -85,40 +85,44 @@ impl FdTransport {
     /// # Safety
     /// `fd` must be a connected socket that nothing else owns or reads/writes concurrently.
     pub unsafe fn from_raw_fd(fd: std::os::unix::io::RawFd) -> io::Result<Self> {
-        use std::os::unix::io::FromRawFd;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-        // tokio requires a nonblocking fd; an inherited one usually isn't.
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
+        // SAFETY: the caller hands us `fd` to own.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let mut domain: libc::c_int = 0;
         let mut len = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap();
-        let rc = libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_DOMAIN,
-            &mut domain as *mut _ as *mut libc::c_void,
-            &mut len,
-        );
+        // SAFETY: `fd` is open, and `domain` and `len` are live locals of the sizes passed.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_DOMAIN,
+                (&raw mut domain).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
 
+        // tokio requires a nonblocking socket; an inherited one usually isn't.
         match domain {
-            libc::AF_UNIX => Ok(Self(FdInner::Unix(UnixStream::from_std(
-                std::os::unix::net::UnixStream::from_raw_fd(fd),
-            )?))),
-            libc::AF_INET | libc::AF_INET6 => Ok(Self(FdInner::Tcp(TcpStream::from_std(
-                std::net::TcpStream::from_raw_fd(fd),
-            )?))),
+            libc::AF_UNIX => {
+                let s = std::os::unix::net::UnixStream::from(fd);
+                s.set_nonblocking(true)?;
+                Ok(Self(FdInner::Unix(UnixStream::from_std(s)?)))
+            }
+            libc::AF_INET | libc::AF_INET6 => {
+                let s = std::net::TcpStream::from(fd);
+                s.set_nonblocking(true)?;
+                Ok(Self(FdInner::Tcp(TcpStream::from_std(s)?)))
+            }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("fd {fd} is a socket of unsupported domain {other}"),
+                format!(
+                    "fd {} is a socket of unsupported domain {other}",
+                    fd.as_raw_fd()
+                ),
             )),
         }
     }
