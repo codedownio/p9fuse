@@ -10,6 +10,9 @@
 //! `diod` is run rootless in TCP-listen mode with `-n` (no auth) and `-N` (no userdb), and the
 //! client attaches as the current uid, so `setfsuid` is a no-op and no privilege is required.
 
+// Test data is made by truncating random numbers on purpose.
+#![allow(clippy::cast_possible_truncation)]
+
 use futures_util::{SinkExt, StreamExt};
 use p9fuse::{
     mount_with_invalidations, NineClient, NineTransport, TcpTransport, Tuning, UnixTransport,

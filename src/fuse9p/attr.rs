@@ -15,11 +15,14 @@ pub(super) fn to_fileattr(ino: u64, a: &Attr) -> FileAttr {
         crtime: UNIX_EPOCH,
         kind: kind_from_mode(a.mode),
         perm: (a.mode & 0o7777) as u16,
-        nlink: a.nlink.max(1) as u32,
+        nlink: u32::try_from(a.nlink.max(1)).unwrap_or(u32::MAX),
         uid: a.uid,
         gid: a.gid,
+        // The low 32 bits of a glibc dev_t are the kernel's encoding for devices with major
+        // numbers below 4096, which covers real devices.
+        #[allow(clippy::cast_possible_truncation)]
         rdev: a.rdev as u32,
-        blksize: a.blksize.max(512) as u32,
+        blksize: u32::try_from(a.blksize.max(512)).unwrap_or(u32::MAX),
         flags: 0,
     }
 }
@@ -67,7 +70,8 @@ pub(super) fn time_or_now(t: TimeOrNow) -> (u64, u64) {
 }
 
 fn unixtime((sec, nsec): (u64, u64)) -> SystemTime {
-    UNIX_EPOCH + Duration::new(sec, (nsec as u32).min(999_999_999))
+    let nsec = u32::try_from(nsec.min(999_999_999)).unwrap_or(0);
+    UNIX_EPOCH + Duration::new(sec, nsec)
 }
 
 fn kind_from_mode(mode: u32) -> FileType {

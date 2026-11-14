@@ -11,6 +11,9 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
+/// The longest file name Linux allows.
+const NAME_MAX: usize = 255;
+
 pub(super) struct Invalidator {
     pub notifier: Notifier,
     pub client: Arc<NineClient>,
@@ -67,6 +70,10 @@ impl Invalidator {
         let Some((name, parent)) = comps.split_last() else {
             return;
         };
+        // No file has a longer name, and 9p can't send one over 65535 bytes.
+        if comps.iter().any(|c| c.len() > NAME_MAX) {
+            return;
+        }
         match self.resolve(parent).await {
             Ok(parent_ino) => {
                 let name = name.to_string();

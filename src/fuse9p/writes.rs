@@ -8,7 +8,7 @@ impl Fuse9p {
     /// The flags to open a file's fid with, given the kernel's `flags`, and whether writes through
     /// it go through the write pipeline.
     pub(super) fn open_flags(&self, flags: i32) -> (u32, bool) {
-        let mut oflags = (flags as u32) & !(libc::O_CLOEXEC as u32);
+        let mut oflags = flags.cast_unsigned() & !(libc::O_CLOEXEC as u32);
         let access = oflags & libc::O_ACCMODE as u32;
         let append = oflags & libc::O_APPEND as u32 != 0;
         if self.tuning.writeback_cache {

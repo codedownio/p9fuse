@@ -151,8 +151,14 @@ impl W {
         self.buf.extend_from_slice(&v.to_le_bytes());
         self
     }
+    /// Append a length-prefixed string.
+    ///
+    /// # Panics
+    ///
+    /// If `s` is longer than 9p's 65535-byte limit. Names and symlink targets are far shorter.
     pub fn str(&mut self, s: &str) -> &mut Self {
-        self.u16(s.len() as u16);
+        let len = u16::try_from(s.len()).expect("9p strings are at most 65535 bytes");
+        self.u16(len);
         self.buf.extend_from_slice(s.as_bytes());
         self
     }
