@@ -436,8 +436,8 @@ async fn invalidation_loop(
                 break;
             }
         };
-        // Every line read gets exactly one line echoed back, including one this skips, so the
-        // client can match replies to the paths it sent by order alone.
+        // Every line read gets exactly one reply, including one this skips, so a client can match
+        // replies to the paths it sent by order alone.
         'line: {
             let rel = line.trim().trim_start_matches('/');
             if rel.is_empty() {
@@ -498,11 +498,14 @@ async fn invalidation_loop(
     tracing::info!("mount9p-fuse: invalidation stdin closed");
 }
 
-/// Echo a line back on stdout once its kernel notifications have been issued. A client that orders
-/// work after an invalidation needs this: writing to our stdin only says the path was queued.
+/// Report a path as applied, once its kernel notifications have been issued: `ok <path>` on stdout.
+/// A client that orders work after an invalidation needs this, since writing to our stdin only says
+/// the path was queued. The prefix is what lets a client tell a reply from anything else that ever
+/// reaches stdout, rather than trusting it to carry replies and nothing else.
 async fn echo_applied(out: &mut tokio::io::Stdout, line: &str) {
     use tokio::io::AsyncWriteExt;
-    let mut buf = String::with_capacity(line.len() + 1);
+    let mut buf = String::with_capacity(line.len() + 4);
+    buf.push_str("ok ");
     buf.push_str(line);
     buf.push('\n');
     if let Err(e) = out.write_all(buf.as_bytes()).await {
