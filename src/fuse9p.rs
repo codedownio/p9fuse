@@ -426,6 +426,7 @@ async fn invalidation_loop(
     // never returns). Run every notify on a blocking thread so the runtime keeps servicing 9p.
     let notifier = std::sync::Arc::new(notifier);
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut out = tokio::io::stdout();
     loop {
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
@@ -435,61 +436,115 @@ async fn invalidation_loop(
                 break;
             }
         };
-        let rel = line.trim().trim_start_matches('/');
-        if rel.is_empty() {
-            continue;
-        }
-        let comps: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-        let (name, parent_comps) = match comps.split_last() {
-            Some(x) => x,
-            None => continue,
-        };
-
-        // Parent inode -> drop the dentry for `name` (forces a fresh lookup, picking up creates,
-        // deletes and renames).
-        let pf = client.alloc_fid();
-        let parent_ino = match client.walk(root_fid, pf, parent_comps).await {
-            Ok(qids) => {
-                let _ = client.clunk(pf).await;
-                let pqp = qids.last().map(|q| q.path).unwrap_or(root_qid_path);
-                Some(qid_to_ino(pqp, root_qid_path))
-            }
-            // The walk did not establish pf, so there is nothing to clunk.
-            Err(e) => {
-                tracing::warn!(rel, ?e, "mount9p-fuse: invalidation parent walk failed");
-                None
-            }
-        };
-        if let Some(pino) = parent_ino {
-            let n = notifier.clone();
-            let name_owned = name.to_string();
-            let r = tokio::task::spawn_blocking(move || {
-                n.inval_entry(pino, std::ffi::OsStr::new(&name_owned))
-            })
-            .await;
-            tracing::info!(rel, pino, name, result = ?r, "mount9p-fuse: inval_entry");
-        }
-
-        // Child inode -> drop cached attrs + data (forces re-read of changed content).
-        let cf = client.alloc_fid();
-        match client.walk(root_fid, cf, &comps).await {
-            Ok(qids) => {
-                let _ = client.clunk(cf).await;
-                if let Some(q) = qids.last() {
-                    let ino = qid_to_ino(q.path, root_qid_path);
-                    let n = notifier.clone();
-                    let r = tokio::task::spawn_blocking(move || n.inval_inode(ino, 0, 0)).await;
-                    tracing::info!(rel, ino, result = ?r, "mount9p-fuse: inval_inode");
+        // "inval <id> <escaped path>", or a bare unescaped path from a client that predates ids.
+        // Every request gets exactly one reply, including one whose path resolves to nothing.
+        let (reply_id, path) = match line.strip_prefix("inval ") {
+            Some(rest) => {
+                let (id, escaped) = rest.split_once(' ').unwrap_or((rest, ""));
+                match decode_path(escaped) {
+                    Ok(p) => (Some(id.to_string()), p),
+                    Err(e) => {
+                        tracing::warn!(
+                            id,
+                            escaped,
+                            e,
+                            "mount9p-fuse: undecodable invalidation path"
+                        );
+                        reply(&mut out, &format!("err {id} {e}")).await;
+                        continue;
+                    }
                 }
             }
-            // The walk did not establish cf, so there is nothing to clunk. This is the common case:
-            // an invalidation for a deleted or renamed path no longer resolves.
-            Err(e) => {
-                tracing::warn!(rel, ?e, "mount9p-fuse: invalidation child walk failed");
+            None => (None, line.clone()),
+        };
+        'line: {
+            let rel = path.trim().trim_start_matches('/');
+            if rel.is_empty() {
+                break 'line;
             }
+            let comps: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+            let (name, parent_comps) = match comps.split_last() {
+                Some(x) => x,
+                None => break 'line,
+            };
+
+            // Parent inode -> drop the dentry for `name` (forces a fresh lookup, picking up creates,
+            // deletes and renames).
+            let pf = client.alloc_fid();
+            let parent_ino = match client.walk(root_fid, pf, parent_comps).await {
+                Ok(qids) => {
+                    let _ = client.clunk(pf).await;
+                    let pqp = qids.last().map(|q| q.path).unwrap_or(root_qid_path);
+                    Some(qid_to_ino(pqp, root_qid_path))
+                }
+                // The walk did not establish pf, so there is nothing to clunk.
+                Err(e) => {
+                    tracing::warn!(rel, ?e, "mount9p-fuse: invalidation parent walk failed");
+                    None
+                }
+            };
+            if let Some(pino) = parent_ino {
+                let n = notifier.clone();
+                let name_owned = name.to_string();
+                let r = tokio::task::spawn_blocking(move || {
+                    n.inval_entry(pino, std::ffi::OsStr::new(&name_owned))
+                })
+                .await;
+                tracing::info!(rel, pino, name, result = ?r, "mount9p-fuse: inval_entry");
+            }
+
+            // Child inode -> drop cached attrs + data (forces re-read of changed content).
+            let cf = client.alloc_fid();
+            match client.walk(root_fid, cf, &comps).await {
+                Ok(qids) => {
+                    let _ = client.clunk(cf).await;
+                    if let Some(q) = qids.last() {
+                        let ino = qid_to_ino(q.path, root_qid_path);
+                        let n = notifier.clone();
+                        let r = tokio::task::spawn_blocking(move || n.inval_inode(ino, 0, 0)).await;
+                        tracing::info!(rel, ino, result = ?r, "mount9p-fuse: inval_inode");
+                    }
+                }
+                // The walk did not establish cf, so there is nothing to clunk. This is the common case:
+                // an invalidation for a deleted or renamed path no longer resolves.
+                Err(e) => {
+                    tracing::warn!(rel, ?e, "mount9p-fuse: invalidation child walk failed");
+                }
+            }
+        }
+        match &reply_id {
+            Some(id) => reply(&mut out, &format!("ok {id}")).await,
+            None => reply(&mut out, &format!("ok {path}")).await,
         }
     }
     tracing::info!("mount9p-fuse: invalidation stdin closed");
+}
+
+/// Percent-decode a request's path. The client percent-encodes it because a filename may contain
+/// the newline that ends one request, and may contain the `%` that starts an escape.
+fn decode_path(s: &str) -> Result<String, &'static str> {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8()
+        .map(|p| p.into_owned())
+        .map_err(|_| "path wasn't utf-8 once decoded")
+}
+
+/// Write one reply line on stdout, once the request it answers has been applied. A client that
+/// orders work after an invalidation needs this, since writing to our stdin only says the path was
+/// queued. Replies are tagged so a client can tell one from anything else that ever reaches stdout,
+/// and match it to the request it answers rather than relying on position.
+async fn reply(out: &mut tokio::io::Stdout, line: &str) {
+    use tokio::io::AsyncWriteExt;
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    if let Err(e) = out.write_all(buf.as_bytes()).await {
+        tracing::warn!(?e, "mount9p-fuse: couldn't write an invalidation reply");
+        return;
+    }
+    if let Err(e) = out.flush().await {
+        tracing::warn!(?e, "mount9p-fuse: couldn't flush an invalidation reply");
+    }
 }
 
 impl Filesystem for Fuse9p {
@@ -1288,5 +1343,33 @@ impl Fuse9p {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_path;
+
+    // The forms the client is expected to send. These pin the agreement between its encoder and
+    // this decoder, which are separate libraries in separate languages.
+    #[test]
+    fn decodes_what_the_client_encodes() {
+        assert_eq!(decode_path("foo.typ"), Ok("foo.typ".to_string()));
+        assert_eq!(decode_path("."), Ok(".".to_string()));
+        assert_eq!(decode_path(""), Ok("".to_string()));
+        assert_eq!(
+            decode_path("inc%2Fheader.typ"),
+            Ok("inc/header.typ".to_string())
+        );
+        assert_eq!(decode_path("we%0Aird.typ"), Ok("we\nird.typ".to_string()));
+        assert_eq!(decode_path("we%0Dird.typ"), Ok("we\rird.typ".to_string()));
+        assert_eq!(decode_path("a%25b.typ"), Ok("a%b.typ".to_string()));
+        assert_eq!(decode_path("a%20b.typ"), Ok("a b.typ".to_string()));
+        assert_eq!(decode_path("h%C3%A9ader.typ"), Ok("héader.typ".to_string()));
+    }
+
+    #[test]
+    fn refuses_bytes_that_are_not_utf8_once_decoded() {
+        assert_eq!(decode_path("%FF%FE"), Err("path wasn't utf-8 once decoded"));
     }
 }
