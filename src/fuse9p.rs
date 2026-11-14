@@ -52,7 +52,8 @@ pub struct Tuning {
     pub writeback_cache: bool,
     /// Pipeline writes: acknowledge each FUSE `write` at once and send its `Twrite` from a background
     /// task, up to `wb_depth` in flight per file, turning latency-bound sequential writes into
-    /// throughput. A write waits for overlapping writes still in flight. Errors surface at
+    /// throughput. A write waits for overlapping writes still in flight, and when the pipeline is
+    /// full, adjacent small writes are merged into one `Twrite`. Errors surface at
     /// flush/fsync/release. Off = each `write` is one synchronous `Twrite` round-trip. O_APPEND
     /// handles write synchronously unless `writeback_cache` is on.
     pub write_pipeline: bool,

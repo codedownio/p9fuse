@@ -1,7 +1,13 @@
 //! Pipelined writes for one inode. A FUSE `write` is acknowledged as soon as it is queued here; the
-//! `Twrite`s go out from background tasks, up to `depth` at a time. A write never overtakes an
-//! earlier write it overlaps: the server may apply concurrent `Twrite`s in any order, so a write
-//! waits for every overlapping write still in flight before it is sent.
+//! `Twrite`s go out from background tasks, up to `depth` at a time. Two rules keep the file's
+//! contents what the application wrote:
+//!
+//! - A write never overtakes an earlier write it overlaps. The server may apply concurrent `Twrite`s
+//!   in any order, so a write waits for every overlapping write still in flight before it is sent.
+//! - When every slot is busy, a write that continues exactly where the previous one ended is merged
+//!   into a single pending buffer (up to one `Twrite`'s worth) instead of waiting for a slot, and the
+//!   first write to finish sends it. Runs of small sequential writes over a slow link then go out
+//!   as a few large `Twrite`s; on an idle pipeline nothing is held back.
 //!
 //! The FUSE session calls `write` and `settle` from one thread at a time, so only the background
 //! tasks run concurrently with them.
@@ -31,9 +37,10 @@ impl Write {
 /// The write pipeline of one inode, shared by all its open handles.
 pub(crate) struct InodeWrites {
     client: Arc<NineClient>,
-    /// The most bytes one `Twrite` carries.
+    /// The most bytes one `Twrite` carries; also the cap on a merged pending buffer.
     chunk: usize,
-    /// One permit per write in flight.
+    /// One permit per `Twrite` in flight. Every held permit belongs to a running task, which is
+    /// what guarantees a pending buffer is eventually sent.
     slots: Arc<Semaphore>,
     state: Mutex<State>,
 }
@@ -42,6 +49,9 @@ pub(crate) struct InodeWrites {
 struct State {
     /// Writes handed to a task and not yet finished, oldest first.
     inflight: Vec<InFlight>,
+    /// Newer than everything in `inflight`; sent by the next task to finish, or by the next write
+    /// or settle that cannot merge into it.
+    pending: Option<Write>,
     next_id: u64,
 }
 
@@ -66,17 +76,54 @@ impl InodeWrites {
     /// Whether any write is still unsent or in flight.
     pub(crate) fn busy(&self) -> bool {
         let st = self.state.lock().unwrap();
-        !st.inflight.is_empty()
+        st.pending.is_some() || !st.inflight.is_empty()
     }
 
-    /// Queue `w`. Returns once it is handed to a background task; blocks while every slot is busy.
+    /// Queue `w`. Returns once it is merged into the pending buffer or handed to a background task;
+    /// blocks only while every slot is busy and `w` cannot be merged.
     pub(crate) async fn write(self: &Arc<Self>, w: Write) {
-        let permit = self.acquire().await;
+        let earlier = {
+            let mut st = self.state.lock().unwrap();
+            if let Some(p) = st.pending.as_mut() {
+                if p.fid == w.fid && p.end() == w.off && p.data.len() + w.data.len() <= self.chunk {
+                    p.data.extend_from_slice(&w.data);
+                    return;
+                }
+            }
+            st.pending.take()
+        };
+        // The pending buffer is older than `w`, so it goes out first.
+        if let Some(p) = earlier {
+            let permit = self.acquire().await;
+            self.start(permit, p);
+        }
+        let permit = {
+            let mut st = self.state.lock().unwrap();
+            // Checked under the lock that tasks release their permits under: if this fails, some
+            // task still holds a slot and will see the pending buffer when it finishes.
+            match self.slots.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) if w.data.len() < self.chunk => {
+                    st.pending = Some(w);
+                    return;
+                }
+                Err(_) => None,
+            }
+        };
+        let permit = match permit {
+            Some(permit) => permit,
+            None => self.acquire().await,
+        };
         self.start(permit, w);
     }
 
-    /// Wait until every write on this inode has finished.
-    pub(crate) async fn settle(&self) {
+    /// Send the pending buffer and wait until every write on this inode has finished.
+    pub(crate) async fn settle(self: &Arc<Self>) {
+        let earlier = self.state.lock().unwrap().pending.take();
+        if let Some(p) = earlier {
+            let permit = self.acquire().await;
+            self.start(permit, p);
+        }
         let waits: Vec<watch::Receiver<()>> = {
             let st = self.state.lock().unwrap();
             st.inflight.iter().map(|f| f.done.clone()).collect()
@@ -102,20 +149,35 @@ impl InodeWrites {
         tokio::spawn(self.clone().run(permit, w, started));
     }
 
-    /// Send `w` once the writes it overlaps have finished.
-    async fn run(self: Arc<Self>, permit: OwnedSemaphorePermit, w: Write, started: Started) {
-        for mut done in started.waits {
-            let _ = done.changed().await;
+    /// Send `w` once the writes it overlaps have finished, then keep the slot for the pending buffer
+    /// if there is one.
+    async fn run(
+        self: Arc<Self>,
+        permit: OwnedSemaphorePermit,
+        mut w: Write,
+        mut started: Started,
+    ) {
+        loop {
+            for mut done in std::mem::take(&mut started.waits) {
+                let _ = done.changed().await;
+            }
+            if let Err(e) = write_all(&self.client, w.fid, w.off, &w.data, self.chunk).await {
+                w.err.lock().unwrap().get_or_insert(e);
+            }
+            let mut st = self.state.lock().unwrap();
+            st.inflight.retain(|f| f.id != started.id);
+            match st.pending.take() {
+                Some(next) => {
+                    started = register(&mut st, &next);
+                    w = next;
+                }
+                None => {
+                    // Released under the lock; see `write`.
+                    drop(permit);
+                    return;
+                }
+            }
         }
-        if let Err(e) = write_all(&self.client, w.fid, w.off, &w.data, self.chunk).await {
-            w.err.lock().unwrap().get_or_insert(e);
-        }
-        self.state
-            .lock()
-            .unwrap()
-            .inflight
-            .retain(|f| f.id != started.id);
-        drop(permit);
     }
 }
 

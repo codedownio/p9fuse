@@ -691,6 +691,45 @@ async fn stat_and_read_see_pipelined_writes() {
     .await;
 }
 
+/// Writes held back for merging still reach the server when the application stops writing and
+/// neither closes nor stats the file: the write that was in flight sends them when it finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merged_writes_reach_server_without_close() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP merged_writes_reach_server_without_close: {reason}");
+        return;
+    }
+    let tuning = Tuning {
+        wb_depth: 1,
+        ..Tuning::default()
+    };
+    with_mount_full(Via::Tcp, tuning, |m| {
+        let mut f = std::fs::File::create(m.mp.join("m")).unwrap();
+        let mut expected = Vec::new();
+        // Small writes, then a large one immediately followed by a small one: the last write
+        // arrives while the large one is in flight, so it is held back.
+        let mut chunks: Vec<Vec<u8>> = (0..256u32).map(|i| vec![(i % 251) as u8; 1000]).collect();
+        chunks.push(vec![b'L'; 400_000]);
+        chunks.push(vec![b'E'; 1000]);
+        for chunk in chunks {
+            f.write_all(&chunk).unwrap();
+            expected.extend_from_slice(&chunk);
+        }
+
+        // Read the export directly, so nothing on the mount side forces the writes out.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = std::fs::read(m.export.join("m")).unwrap();
+        while got != expected && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            got = std::fs::read(m.export.join("m")).unwrap();
+        }
+        assert_eq!(got.len(), expected.len(), "bytes on the server");
+        assert!(got == expected, "contents on the server");
+        drop(f);
+    })
+    .await;
+}
+
 /// The same core ops over the Unix-socket transport (relayed to diod's TCP port).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unix_transport() {
@@ -827,7 +866,8 @@ async fn offset_writes() {
 }
 
 /// The write modes: the default (pipeline, no kernel cache), the same with a pipeline one write
-/// deep, pipeline plus kernel writeback cache, and fully synchronous writes.
+/// deep (so nearly every write arriving while another is in flight is merged), pipeline plus kernel
+/// writeback cache, and fully synchronous writes.
 fn write_modes() -> [(&'static str, Tuning); 4] {
     [
         ("pipeline", Tuning::default()),
