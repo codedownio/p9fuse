@@ -436,10 +436,24 @@ async fn invalidation_loop(
                 break;
             }
         };
-        // Every line read gets exactly one reply, including one this skips, so a client can match
-        // replies to the paths it sent by order alone.
+        // "inval <id> <escaped path>", or a bare unescaped path from a client that predates ids.
+        // Every request gets exactly one reply, including one whose path resolves to nothing.
+        let (reply_id, path) = match line.strip_prefix("inval ") {
+            Some(rest) => {
+                let (id, escaped) = rest.split_once(' ').unwrap_or((rest, ""));
+                match unescape(escaped) {
+                    Ok(p) => (Some(id.to_string()), p),
+                    Err(e) => {
+                        tracing::warn!(id, escaped, e, "mount9p-fuse: undecodable invalidation path");
+                        reply(&mut out, &format!("err {id} {e}")).await;
+                        continue;
+                    }
+                }
+            }
+            None => (None, line.clone()),
+        };
         'line: {
-            let rel = line.trim().trim_start_matches('/');
+            let rel = path.trim().trim_start_matches('/');
             if rel.is_empty() {
                 break 'line;
             }
@@ -493,27 +507,49 @@ async fn invalidation_loop(
                 }
             }
         }
-        echo_applied(&mut out, &line).await;
+        match &reply_id {
+            Some(id) => reply(&mut out, &format!("ok {id}")).await,
+            None => reply(&mut out, &format!("ok {path}")).await,
+        }
     }
     tracing::info!("mount9p-fuse: invalidation stdin closed");
 }
 
-/// Report a path as applied, once its kernel notifications have been issued: `ok <path>` on stdout.
-/// A client that orders work after an invalidation needs this, since writing to our stdin only says
-/// the path was queued. The prefix is what lets a client tell a reply from anything else that ever
-/// reaches stdout, rather than trusting it to carry replies and nothing else.
-async fn echo_applied(out: &mut tokio::io::Stdout, line: &str) {
+/// Undo the escaping of the bytes the line protocol can't carry. The client escapes `%`, LF and CR;
+/// any `%XX` is accepted so it can escape more without this needing to change.
+fn unescape(s: &str) -> Result<String, &'static str> {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        let hex = b.get(i + 1..i + 3).ok_or("truncated escape")?;
+        let hex = std::str::from_utf8(hex).map_err(|_| "bad escape")?;
+        out.push(u8::from_str_radix(hex, 16).map_err(|_| "bad escape")?);
+        i += 3;
+    }
+    String::from_utf8(out).map_err(|_| "escaped path wasn't utf-8")
+}
+
+/// Write one reply line on stdout, once the request it answers has been applied. A client that
+/// orders work after an invalidation needs this, since writing to our stdin only says the path was
+/// queued. Replies are tagged so a client can tell one from anything else that ever reaches stdout,
+/// and match it to the request it answers rather than relying on position.
+async fn reply(out: &mut tokio::io::Stdout, line: &str) {
     use tokio::io::AsyncWriteExt;
-    let mut buf = String::with_capacity(line.len() + 4);
-    buf.push_str("ok ");
+    let mut buf = String::with_capacity(line.len() + 1);
     buf.push_str(line);
     buf.push('\n');
     if let Err(e) = out.write_all(buf.as_bytes()).await {
-        tracing::warn!(?e, "mount9p-fuse: couldn't echo an applied invalidation");
+        tracing::warn!(?e, "mount9p-fuse: couldn't write an invalidation reply");
         return;
     }
     if let Err(e) = out.flush().await {
-        tracing::warn!(?e, "mount9p-fuse: couldn't flush an applied invalidation");
+        tracing::warn!(?e, "mount9p-fuse: couldn't flush an invalidation reply");
     }
 }
 
@@ -1313,5 +1349,39 @@ impl Fuse9p {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unescape;
+
+    #[test]
+    fn decodes_the_delimiters_the_line_protocol_cannot_carry() {
+        assert_eq!(unescape("we%0Aird.typ"), Ok("we\nird.typ".to_string()));
+        assert_eq!(unescape("we%0Dird.typ"), Ok("we\rird.typ".to_string()));
+        assert_eq!(unescape("a%25b.typ"), Ok("a%b.typ".to_string()));
+        assert_eq!(unescape("%0A%25%0D"), Ok("\n%\r".to_string()));
+    }
+
+    #[test]
+    fn leaves_everything_else_alone() {
+        assert_eq!(unescape("inc/header.typ"), Ok("inc/header.typ".to_string()));
+        assert_eq!(unescape("."), Ok(".".to_string()));
+        assert_eq!(unescape(""), Ok("".to_string()));
+        // Spaces need no escaping: the id is split off at the first one
+        assert_eq!(unescape("a b.typ"), Ok("a b.typ".to_string()));
+        // Multi-byte characters pass through, and can also be escaped byte by byte
+        assert_eq!(unescape("héader.typ"), Ok("héader.typ".to_string()));
+        assert_eq!(unescape("h%C3%A9ader.typ"), Ok("héader.typ".to_string()));
+    }
+
+    #[test]
+    fn rejects_an_escape_it_cannot_decode() {
+        assert_eq!(unescape("bad%ZZ.typ"), Err("bad escape"));
+        assert_eq!(unescape("truncated%0"), Err("truncated escape"));
+        assert_eq!(unescape("truncated%"), Err("truncated escape"));
+        // A byte sequence that isn't UTF-8 once decoded
+        assert_eq!(unescape("%FF%FE"), Err("escaped path wasn't utf-8"));
     }
 }
