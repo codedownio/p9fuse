@@ -1,0 +1,18 @@
+# cargo-deny settings. `nix flake check` runs the licenses, bans and sources checks; security
+# advisories are checked by cargo-audit there, since cargo-deny can't download them in the sandbox.
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2021-0154", reason = "Only affects fuser's libfuse code, which we build without (default-features = false)." },
+]

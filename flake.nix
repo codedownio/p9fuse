@@ -5,9 +5,14 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
+    # RustSec security advisories, for the audit check. `nix flake update advisory-db` refreshes it.
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, crane, flake-utils }:
+  outputs = { self, nixpkgs, crane, flake-utils, advisory-db }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -46,8 +51,8 @@
         packages.default = p9fuse;
         packages.p9fuse = p9fuse;
 
-        # `nix flake check` runs all of these: build, clippy (-D warnings), docs (-D warnings), and
-        # rustfmt.
+        # `nix flake check` runs all of these: build, clippy (-D warnings), docs (-D warnings),
+        # rustfmt, and dependency checks.
         checks = {
           inherit p9fuse;
           clippy = craneLib.cargoClippy (commonArgs // {
@@ -59,6 +64,17 @@
             RUSTDOCFLAGS = "-D warnings";
           });
           fmt = craneLib.cargoFmt { inherit (commonArgs) src; };
+          # Licenses, banned crates and crate sources, as configured in deny.toml.
+          deny = craneLib.cargoDeny {
+            src = ./.;
+            cargoDenyChecks = "bans licenses sources";
+          };
+          # Known security advisories, including unsound ones.
+          audit = craneLib.cargoAudit {
+            inherit advisory-db;
+            src = ./.;
+            cargoAuditExtraArgs = "--deny unsound --ignore RUSTSEC-2021-0154";
+          };
         };
 
         devShells.default = craneLib.devShell {
