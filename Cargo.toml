@@ -42,3 +42,8 @@ tempfile = "3"
 [profile.release]
 lto = true
 codegen-units = 1
+
+# CI runs clippy with -D warnings, so everything here set to "warn" fails CI.
+[lints.rust]
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"

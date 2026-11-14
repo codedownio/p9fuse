@@ -26,7 +26,7 @@ const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
 const READDIR_BYTES: u32 = 8192;
 
 impl Filesystem for Fuse9p {
-    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> Result<(), libc::c_int> {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), libc::c_int> {
         // Let reads and writes be as large as a 9p message allows, rather than 128 KiB.
         let max = self.client.msize.saturating_sub(64).max(8192);
         let _ = config.set_max_write(max);
@@ -40,7 +40,7 @@ impl Filesystem for Fuse9p {
         Ok(())
     }
 
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let parent_fid = or_reply!(reply, self.fid_of(parent));
         let name = name.to_string_lossy();
         let found = self.walk(parent_fid, &[&name]).and_then(|(fid, qids)| {
@@ -60,7 +60,7 @@ impl Filesystem for Fuse9p {
         }
     }
 
-    fn forget(&mut self, _req: &Request, ino: u64, nlookup: u64) {
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
         if ino == ROOT_INO {
             return;
         }
@@ -74,7 +74,7 @@ impl Filesystem for Fuse9p {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         let fid = or_reply!(reply, self.fid_of(ino));
         self.settle_writes(Some(ino));
         let attr = or_reply!(reply, self.rt.block_on(self.client.getattr(fid)));
@@ -83,7 +83,7 @@ impl Filesystem for Fuse9p {
 
     fn setattr(
         &mut self,
-        _req: &Request,
+        _req: &Request<'_>,
         ino: u64,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -135,7 +135,7 @@ impl Filesystem for Fuse9p {
         reply.attr(&self.tuning.attr_ttl, &to_fileattr(ino, &attr));
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         let base = or_reply!(reply, self.fid_of(ino));
         let (oflags, pipelined) = self.open_flags(flags);
         if oflags & libc::O_TRUNC as u32 != 0 {
@@ -149,7 +149,7 @@ impl Filesystem for Fuse9p {
 
     fn read(
         &mut self,
-        _req: &Request,
+        _req: &Request<'_>,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -168,7 +168,7 @@ impl Filesystem for Fuse9p {
 
     fn write(
         &mut self,
-        _req: &Request,
+        _req: &Request<'_>,
         _ino: u64,
         fh: u64,
         offset: i64,
@@ -201,7 +201,7 @@ impl Filesystem for Fuse9p {
         reply.written(data.len() as u32);
     }
 
-    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock: u64, reply: ReplyEmpty) {
+    fn flush(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _lock: u64, reply: ReplyEmpty) {
         // Called on every close(2), which is where a write error should show up.
         match self.handles.get(&fh).and_then(|h| self.take_write_error(h)) {
             Some(e) => reply.error(e),
@@ -209,7 +209,14 @@ impl Filesystem for Fuse9p {
         }
     }
 
-    fn fsync(&mut self, _req: &Request, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         let Ok(h) = self.handle(fh) else {
             return reply.ok();
         };
@@ -223,7 +230,7 @@ impl Filesystem for Fuse9p {
 
     fn release(
         &mut self,
-        _req: &Request,
+        _req: &Request<'_>,
         _ino: u64,
         fh: u64,
         _flags: i32,
@@ -239,7 +246,7 @@ impl Filesystem for Fuse9p {
 
     fn create(
         &mut self,
-        req: &Request,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -269,7 +276,7 @@ impl Filesystem for Fuse9p {
         reply.created(&self.tuning.entry_ttl, &attr, 0, fh, 0);
     }
 
-    fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         let base = or_reply!(reply, self.fid_of(ino));
         let fid = or_reply!(reply, self.open_fid(base, libc::O_RDONLY as u32));
         let fh = self.insert_handle(fid, ino, false);
@@ -278,7 +285,7 @@ impl Filesystem for Fuse9p {
 
     fn readdir(
         &mut self,
-        _req: &Request,
+        _req: &Request<'_>,
         _ino: u64,
         fh: u64,
         offset: i64,
@@ -303,7 +310,7 @@ impl Filesystem for Fuse9p {
     /// `readdir` that also returns each entry's attributes. Only used with `Tuning::readdirplus`.
     fn readdirplus(
         &mut self,
-        _req: &Request,
+        _req: &Request<'_>,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -340,14 +347,21 @@ impl Filesystem for Fuse9p {
         reply.ok();
     }
 
-    fn releasedir(&mut self, _req: &Request, _ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        reply: ReplyEmpty,
+    ) {
         self.close_handle(fh);
         reply.ok();
     }
 
     fn mkdir(
         &mut self,
-        req: &Request,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -365,7 +379,7 @@ impl Filesystem for Fuse9p {
 
     fn symlink(
         &mut self,
-        req: &Request,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         target: &Path,
@@ -379,23 +393,23 @@ impl Filesystem for Fuse9p {
         self.reply_new_entry(parent_fid, &name, reply);
     }
 
-    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
         let fid = or_reply!(reply, self.fid_of(ino));
         let target = or_reply!(reply, self.rt.block_on(self.client.readlink(fid)));
         reply.data(target.as_bytes());
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         self.remove(parent, name, 0, reply);
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         self.remove(parent, name, libc::AT_REMOVEDIR as u32, reply);
     }
 
     fn rename(
         &mut self,
-        _req: &Request,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         newparent: u64,
@@ -424,7 +438,7 @@ impl Filesystem for Fuse9p {
         reply.ok();
     }
 
-    fn statfs(&mut self, _req: &Request, ino: u64, reply: ReplyStatfs) {
+    fn statfs(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyStatfs) {
         let fid = self.fid_of(ino).unwrap_or(self.client.root_fid);
         let stats = or_reply!(reply, self.rt.block_on(self.client.statfs(fid)));
         let (bsize, blocks, bfree, bavail, files, ffree, namelen) = stats;
