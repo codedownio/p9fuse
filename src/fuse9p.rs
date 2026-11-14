@@ -426,6 +426,7 @@ async fn invalidation_loop(
     // never returns). Run every notify on a blocking thread so the runtime keeps servicing 9p.
     let notifier = std::sync::Arc::new(notifier);
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut out = tokio::io::stdout();
     loop {
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
@@ -435,61 +436,82 @@ async fn invalidation_loop(
                 break;
             }
         };
-        let rel = line.trim().trim_start_matches('/');
-        if rel.is_empty() {
-            continue;
-        }
-        let comps: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
-        let (name, parent_comps) = match comps.split_last() {
-            Some(x) => x,
-            None => continue,
-        };
-
-        // Parent inode -> drop the dentry for `name` (forces a fresh lookup, picking up creates,
-        // deletes and renames).
-        let pf = client.alloc_fid();
-        let parent_ino = match client.walk(root_fid, pf, parent_comps).await {
-            Ok(qids) => {
-                let _ = client.clunk(pf).await;
-                let pqp = qids.last().map(|q| q.path).unwrap_or(root_qid_path);
-                Some(qid_to_ino(pqp, root_qid_path))
+        // Every line read gets exactly one line echoed back, including one this skips, so the
+        // client can match replies to the paths it sent by order alone.
+        'line: {
+            let rel = line.trim().trim_start_matches('/');
+            if rel.is_empty() {
+                break 'line;
             }
-            // The walk did not establish pf, so there is nothing to clunk.
-            Err(e) => {
-                tracing::warn!(rel, ?e, "mount9p-fuse: invalidation parent walk failed");
-                None
-            }
-        };
-        if let Some(pino) = parent_ino {
-            let n = notifier.clone();
-            let name_owned = name.to_string();
-            let r = tokio::task::spawn_blocking(move || {
-                n.inval_entry(pino, std::ffi::OsStr::new(&name_owned))
-            })
-            .await;
-            tracing::info!(rel, pino, name, result = ?r, "mount9p-fuse: inval_entry");
-        }
+            let comps: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+            let (name, parent_comps) = match comps.split_last() {
+                Some(x) => x,
+                None => break 'line,
+            };
 
-        // Child inode -> drop cached attrs + data (forces re-read of changed content).
-        let cf = client.alloc_fid();
-        match client.walk(root_fid, cf, &comps).await {
-            Ok(qids) => {
-                let _ = client.clunk(cf).await;
-                if let Some(q) = qids.last() {
-                    let ino = qid_to_ino(q.path, root_qid_path);
-                    let n = notifier.clone();
-                    let r = tokio::task::spawn_blocking(move || n.inval_inode(ino, 0, 0)).await;
-                    tracing::info!(rel, ino, result = ?r, "mount9p-fuse: inval_inode");
+            // Parent inode -> drop the dentry for `name` (forces a fresh lookup, picking up creates,
+            // deletes and renames).
+            let pf = client.alloc_fid();
+            let parent_ino = match client.walk(root_fid, pf, parent_comps).await {
+                Ok(qids) => {
+                    let _ = client.clunk(pf).await;
+                    let pqp = qids.last().map(|q| q.path).unwrap_or(root_qid_path);
+                    Some(qid_to_ino(pqp, root_qid_path))
+                }
+                // The walk did not establish pf, so there is nothing to clunk.
+                Err(e) => {
+                    tracing::warn!(rel, ?e, "mount9p-fuse: invalidation parent walk failed");
+                    None
+                }
+            };
+            if let Some(pino) = parent_ino {
+                let n = notifier.clone();
+                let name_owned = name.to_string();
+                let r = tokio::task::spawn_blocking(move || {
+                    n.inval_entry(pino, std::ffi::OsStr::new(&name_owned))
+                })
+                .await;
+                tracing::info!(rel, pino, name, result = ?r, "mount9p-fuse: inval_entry");
+            }
+
+            // Child inode -> drop cached attrs + data (forces re-read of changed content).
+            let cf = client.alloc_fid();
+            match client.walk(root_fid, cf, &comps).await {
+                Ok(qids) => {
+                    let _ = client.clunk(cf).await;
+                    if let Some(q) = qids.last() {
+                        let ino = qid_to_ino(q.path, root_qid_path);
+                        let n = notifier.clone();
+                        let r = tokio::task::spawn_blocking(move || n.inval_inode(ino, 0, 0)).await;
+                        tracing::info!(rel, ino, result = ?r, "mount9p-fuse: inval_inode");
+                    }
+                }
+                // The walk did not establish cf, so there is nothing to clunk. This is the common case:
+                // an invalidation for a deleted or renamed path no longer resolves.
+                Err(e) => {
+                    tracing::warn!(rel, ?e, "mount9p-fuse: invalidation child walk failed");
                 }
             }
-            // The walk did not establish cf, so there is nothing to clunk. This is the common case:
-            // an invalidation for a deleted or renamed path no longer resolves.
-            Err(e) => {
-                tracing::warn!(rel, ?e, "mount9p-fuse: invalidation child walk failed");
-            }
         }
+        echo_applied(&mut out, &line).await;
     }
     tracing::info!("mount9p-fuse: invalidation stdin closed");
+}
+
+/// Echo a line back on stdout once its kernel notifications have been issued. A client that orders
+/// work after an invalidation needs this: writing to our stdin only says the path was queued.
+async fn echo_applied(out: &mut tokio::io::Stdout, line: &str) {
+    use tokio::io::AsyncWriteExt;
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    if let Err(e) = out.write_all(buf.as_bytes()).await {
+        tracing::warn!(?e, "mount9p-fuse: couldn't echo an applied invalidation");
+        return;
+    }
+    if let Err(e) = out.flush().await {
+        tracing::warn!(?e, "mount9p-fuse: couldn't flush an applied invalidation");
+    }
 }
 
 impl Filesystem for Fuse9p {
