@@ -12,9 +12,10 @@
 
 use futures_util::{SinkExt, StreamExt};
 use p9fuse::{
-    mount, NineClient, NineTransport, TcpTransport, Tuning, UnixTransport, WebSocketTransport,
+    mount_with_invalidations, NineClient, NineTransport, TcpTransport, Tuning, UnixTransport,
+    WebSocketTransport,
 };
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -277,12 +278,28 @@ async fn ws_tcp_bridge(
     tokio::select! { _ = c2s => {}, _ = s2c => {} }
 }
 
+/// What a test body gets: the mountpoint, the export directory behind it (to change files from
+/// outside the mount), and a socket to send the mount invalidation requests and read their replies.
+struct Mounted<'a> {
+    mp: &'a Path,
+    export: &'a Path,
+    inval: std::os::unix::net::UnixStream,
+}
+
 /// Start diod, reach it via `via`, FUSE-mount the export with `tuning`, wait until the mount is live,
 /// run `body` (on a blocking thread, with the mountpoint path), then unmount and tear down. Any panic
 /// in `body` propagates to fail the test.
 async fn with_mount_via<F>(via: Via, tuning: Tuning, body: F)
 where
     F: FnOnce(&Path) + Send + 'static,
+{
+    with_mount_full(via, tuning, |m| body(m.mp)).await;
+}
+
+/// [`with_mount_via`], but the body also gets the export directory and the invalidation input.
+async fn with_mount_full<F>(via: Via, tuning: Tuning, body: F)
+where
+    F: FnOnce(Mounted) + Send + 'static,
 {
     let diod = Diod::start();
     // Seed a readiness sentinel in the export; it appears through the mount once FUSE is live.
@@ -309,6 +326,12 @@ where
         }
     };
 
+    let (inval_tx, inval_rx) = std::os::unix::net::UnixStream::pair().unwrap();
+    inval_rx.set_nonblocking(true).unwrap();
+    let (inval_rx, inval_replies) = tokio::net::UnixStream::from_std(inval_rx)
+        .unwrap()
+        .into_split();
+
     let mountpoint = tempfile::tempdir().unwrap();
     let mp = mountpoint.path().to_path_buf();
     let mp_task = mp.clone();
@@ -316,9 +339,18 @@ where
     let task = tokio::spawn(async move {
         let transport = connect_transport(connect).await?;
         // `mount` blocks until unmounted; the error (if any) surfaces after umount below.
-        mount(transport, &mp_task, 512_000, uid, &aname, tuning)
-            .await
-            .map_err(|e| e.to_string())
+        mount_with_invalidations(
+            transport,
+            &mp_task,
+            512_000,
+            uid,
+            &aname,
+            tuning,
+            Box::new(inval_rx),
+            Box::new(inval_replies),
+        )
+        .await
+        .map_err(|e| e.to_string())
     });
 
     // Wait for the mount to become live (sentinel visible through FUSE).
@@ -337,7 +369,15 @@ where
     }
 
     let mp_body = mp.clone();
-    let outcome = tokio::task::spawn_blocking(move || body(&mp_body)).await;
+    let export = diod.export().to_path_buf();
+    let outcome = tokio::task::spawn_blocking(move || {
+        body(Mounted {
+            mp: &mp_body,
+            export: &export,
+            inval: inval_tx,
+        })
+    })
+    .await;
 
     umount(&mp);
     let mount_result = task.await.expect("mount task join");
@@ -453,7 +493,7 @@ async fn rename_then_read() {
 }
 
 /// A multi-megabyte write with write-back pipelining round-trips byte-for-byte, and the file's size
-/// is correct on the server side.
+/// is correct on the server side. Run with the kernel writeback cache both off and on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writeback_large_file() {
     if let Some(reason) = skip_reason() {
@@ -465,23 +505,29 @@ async fn writeback_large_file() {
     let payload: Vec<u8> = (0..4u64 * 1024 * 1024)
         .map(|i| i.wrapping_mul(2654435761).rotate_right(13) as u8)
         .collect();
-    let expected = payload.clone();
-
-    with_mount(Tuning::default(), move |mp| {
-        let path = mp.join("big.bin");
-        {
-            let mut f = std::fs::File::create(&path).unwrap();
-            // Write in odd-sized chunks to exercise the write-back pipeline across offsets.
-            for chunk in payload.chunks(7919) {
-                f.write_all(chunk).unwrap();
+    for writeback_cache in [false, true] {
+        let payload = payload.clone();
+        let expected = payload.clone();
+        let tuning = Tuning {
+            writeback_cache,
+            ..Tuning::default()
+        };
+        with_mount(tuning, move |mp| {
+            let path = mp.join("big.bin");
+            {
+                let mut f = std::fs::File::create(&path).unwrap();
+                // Write in odd-sized chunks to exercise the write-back pipeline across offsets.
+                for chunk in payload.chunks(7919) {
+                    f.write_all(chunk).unwrap();
+                }
+                f.sync_all().unwrap(); // flush the pipeline
             }
-            f.sync_all().unwrap(); // flush the pipeline
-        }
-        let got = std::fs::read(&path).unwrap();
-        assert_eq!(got.len(), expected.len(), "size mismatch after write-back");
-        assert!(got == expected, "content mismatch after write-back");
-    })
-    .await;
+            let got = std::fs::read(&path).unwrap();
+            assert_eq!(got.len(), expected.len(), "size mismatch after write-back");
+            assert!(got == expected, "content mismatch after write-back");
+        })
+        .await;
+    }
 }
 
 /// `mv src dst` where `dst` already exists: the overwritten file's inode is discarded and `dst` now
@@ -560,7 +606,7 @@ async fn client_rename_then_walk() {
     );
 }
 
-/// With write-back disabled, each write is a synchronous round-trip -- data must still be intact.
+/// With the write pipeline off, each write is a synchronous round-trip -- data must still be intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn synchronous_writes() {
     if let Some(reason) = skip_reason() {
@@ -568,7 +614,7 @@ async fn synchronous_writes() {
         return;
     }
     let tuning = Tuning {
-        writeback: false,
+        write_pipeline: false,
         ..Tuning::default()
     };
     with_mount(tuning, move |mp| {
@@ -578,6 +624,69 @@ async fn synchronous_writes() {
             std::fs::read(&path).unwrap(),
             b"no writeback, one Twrite per write"
         );
+    })
+    .await;
+}
+
+/// A file grown from outside the mount reads back whole once invalidated, even while an open fd keeps
+/// its inode cached. Under the FUSE writeback cache the kernel keeps its own stale size for the
+/// pinned inode and the read comes back cut to the old length, which is why the cache is off by
+/// default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn external_growth_with_pinned_inode() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP external_growth_with_pinned_inode: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |mut m| {
+        let long: &[u8] = b"#let title = \"Changed in the export\"";
+        std::fs::write(m.export.join("f"), b"#let title = \"Original\"").unwrap();
+        assert_eq!(
+            std::fs::read(m.mp.join("f")).unwrap(),
+            b"#let title = \"Original\""
+        );
+
+        let _pin = std::fs::File::open(m.mp.join("f")).unwrap();
+        std::fs::write(m.export.join("f"), long).unwrap();
+        writeln!(m.inval, "inval 1 f").unwrap();
+        let mut reply = String::new();
+        std::io::BufReader::new(&m.inval)
+            .read_line(&mut reply)
+            .unwrap();
+        assert_eq!(reply, "ok 1\n");
+
+        let got = std::fs::read(m.mp.join("f")).unwrap();
+        assert_eq!(String::from_utf8_lossy(&got), String::from_utf8_lossy(long));
+    })
+    .await;
+}
+
+/// `stat` and a read through a second fd see every write made so far on a still-open writer, even
+/// though the write pipeline has acknowledged writes the server may not have yet. Without the
+/// writeback cache the kernel takes size and data from us, so we have to wait for those writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stat_and_read_see_pipelined_writes() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP stat_and_read_see_pipelined_writes: {reason}");
+        return;
+    }
+    with_mount(Tuning::default(), |mp| {
+        const LEN: u64 = 64 * 131072;
+        for trial in 0..10 {
+            let p = mp.join(format!("t{trial}"));
+            let mut w = std::fs::File::create(&p).unwrap();
+            for i in 0..64u8 {
+                w.write_all(&[b'A' + i % 26; 131072]).unwrap();
+            }
+
+            let size = std::fs::metadata(&p).unwrap().len();
+            let read = std::fs::read(&p).unwrap().len() as u64;
+            assert_eq!(
+                (size, read),
+                (LEN, LEN),
+                "trial {trial}: (stat, read) lengths"
+            );
+        }
     })
     .await;
 }
@@ -690,49 +799,31 @@ async fn set_modified_time() {
 
 /// Overwriting at an offset on a *write-only* handle: with the writeback cache on this is a
 /// partial-page read-modify-write, so the kernel issues reads on the write-only handle -- which only
-/// works because `open` upgrades write-only opens to O_RDWR under writeback (else the server EBADFs).
+/// works because `open` upgrades write-only opens to O_RDWR under the cache (else the server EBADFs).
+/// Run with the cache both on and off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offset_writes() {
     if let Some(reason) = skip_reason() {
         eprintln!("SKIP offset_writes: {reason}");
         return;
     }
-    with_mount(Tuning::default(), |mp| {
-        use std::io::{Seek, SeekFrom, Write};
-        let p = mp.join("o");
-        std::fs::write(&p, b"hello world").unwrap();
-        let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
-        f.seek(SeekFrom::Start(6)).unwrap();
-        f.write_all(b"WORLD").unwrap();
-        drop(f);
-        assert_eq!(std::fs::read(&p).unwrap(), b"hello WORLD");
-    })
-    .await;
-}
-
-/// Appending (O_APPEND) lands at end-of-file. Tested with write-back off: under the FUSE writeback
-/// cache the kernel handles O_APPEND itself, which is not reliable, so append semantics are only
-/// well-defined in the synchronous (writeback-off) mode.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn append_writes() {
-    if let Some(reason) = skip_reason() {
-        eprintln!("SKIP append_writes: {reason}");
-        return;
+    for writeback_cache in [false, true] {
+        let tuning = Tuning {
+            writeback_cache,
+            ..Tuning::default()
+        };
+        with_mount(tuning, |mp| {
+            use std::io::{Seek, SeekFrom, Write};
+            let p = mp.join("o");
+            std::fs::write(&p, b"hello world").unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.seek(SeekFrom::Start(6)).unwrap();
+            f.write_all(b"WORLD").unwrap();
+            drop(f);
+            assert_eq!(std::fs::read(&p).unwrap(), b"hello WORLD");
+        })
+        .await;
     }
-    let tuning = Tuning {
-        writeback: false,
-        ..Tuning::default()
-    };
-    with_mount(tuning, |mp| {
-        use std::io::Write;
-        let p = mp.join("a");
-        std::fs::write(&p, b"hello").unwrap();
-        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        f.write_all(b" world").unwrap();
-        drop(f);
-        assert_eq!(std::fs::read(&p).unwrap(), b"hello world");
-    })
-    .await;
 }
 
 /// A directory with enough entries to span multiple `Treaddir` round-trips lists every entry.

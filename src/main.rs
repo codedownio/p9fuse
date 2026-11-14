@@ -94,11 +94,21 @@ enum Cmd {
         /// experiment. Metadata speed comes from the attr/entry caches above, not this.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         readdirplus: bool,
-        /// Pipeline writes (async write-back + kernel writeback cache). Pass false for a synchronous
-        /// round-trip per write (the un-tuned baseline).
+        /// Let the kernel buffer writes in its page cache (FUSE writeback cache). OFF by default: with
+        /// it on, a file grown from outside the mount reads back truncated to its old size while the
+        /// kernel holds its inode, even after invalidation. Only enable it when nothing else writes
+        /// to the export.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        writeback_cache: bool,
+        /// Acknowledge writes immediately and keep up to --wb-depth Twrites per file in flight. Pass
+        /// false for a synchronous round-trip per write (the un-tuned baseline).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        writeback: bool,
-        /// Max concurrent in-flight Twrites per file when writeback is on (pipeline depth).
+        write_pipeline: bool,
+        /// Deprecated: sets both --writeback-cache and --write-pipeline to the given value.
+        #[arg(long, hide = true, action = clap::ArgAction::Set,
+              conflicts_with_all = ["writeback_cache", "write_pipeline"])]
+        writeback: Option<bool>,
+        /// Max concurrent in-flight Twrites per file when --write-pipeline is on (pipeline depth).
         #[arg(long, default_value_t = 16)]
         wb_depth: usize,
 
@@ -165,6 +175,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             entry_ttl,
             negative_ttl,
             readdirplus,
+            writeback_cache,
+            write_pipeline,
             writeback,
             wb_depth,
             detach_on_transport_loss,
@@ -179,7 +191,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 negative_ttl: (negative_ttl > 0)
                     .then(|| std::time::Duration::from_secs(negative_ttl)),
                 readdirplus,
-                writeback,
+                writeback_cache: writeback.unwrap_or(writeback_cache),
+                write_pipeline: writeback.unwrap_or(write_pipeline),
                 wb_depth,
             };
             fuse9p::Fuse9p::run(
@@ -192,6 +205,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 detach_on_transport_loss,
                 default_permissions,
                 std::time::Duration::from_secs(stall_timeout),
+                Box::new(tokio::io::stdin()),
+                Box::new(tokio::io::stdout()),
             )
             .await
         }
