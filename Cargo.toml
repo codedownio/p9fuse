@@ -32,6 +32,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # the WRITEBACK_CACHE cap (7.23); the default min ABI (7.8) compiles those dispatches out.
 fuser = { version = "0.14", default-features = false, features = ["abi-7-31"] }
 libc = "0.2"
+# RFC 3986 percent-encoding for the invalidation path: a filename may contain the newline that
+# delimits one request from the next. Zero further dependencies.
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"

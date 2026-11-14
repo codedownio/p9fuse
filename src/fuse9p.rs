@@ -441,7 +441,7 @@ async fn invalidation_loop(
         let (reply_id, path) = match line.strip_prefix("inval ") {
             Some(rest) => {
                 let (id, escaped) = rest.split_once(' ').unwrap_or((rest, ""));
-                match unescape(escaped) {
+                match decode_path(escaped) {
                     Ok(p) => (Some(id.to_string()), p),
                     Err(e) => {
                         tracing::warn!(id, escaped, e, "mount9p-fuse: undecodable invalidation path");
@@ -515,24 +515,13 @@ async fn invalidation_loop(
     tracing::info!("mount9p-fuse: invalidation stdin closed");
 }
 
-/// Undo the escaping of the bytes the line protocol can't carry. The client escapes `%`, LF and CR;
-/// any `%XX` is accepted so it can escape more without this needing to change.
-fn unescape(s: &str) -> Result<String, &'static str> {
-    let b = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] != b'%' {
-            out.push(b[i]);
-            i += 1;
-            continue;
-        }
-        let hex = b.get(i + 1..i + 3).ok_or("truncated escape")?;
-        let hex = std::str::from_utf8(hex).map_err(|_| "bad escape")?;
-        out.push(u8::from_str_radix(hex, 16).map_err(|_| "bad escape")?);
-        i += 3;
-    }
-    String::from_utf8(out).map_err(|_| "escaped path wasn't utf-8")
+/// Percent-decode a request's path. The client percent-encodes it because a filename may contain
+/// the newline that ends one request, and may contain the `%` that starts an escape.
+fn decode_path(s: &str) -> Result<String, &'static str> {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8()
+        .map(|p| p.into_owned())
+        .map_err(|_| "path wasn't utf-8 once decoded")
 }
 
 /// Write one reply line on stdout, once the request it answers has been applied. A client that
@@ -1354,34 +1343,25 @@ impl Fuse9p {
 
 #[cfg(test)]
 mod tests {
-    use super::unescape;
+    use super::decode_path;
 
+    // The forms the client is expected to send. These pin the agreement between its encoder and
+    // this decoder, which are separate libraries in separate languages.
     #[test]
-    fn decodes_the_delimiters_the_line_protocol_cannot_carry() {
-        assert_eq!(unescape("we%0Aird.typ"), Ok("we\nird.typ".to_string()));
-        assert_eq!(unescape("we%0Dird.typ"), Ok("we\rird.typ".to_string()));
-        assert_eq!(unescape("a%25b.typ"), Ok("a%b.typ".to_string()));
-        assert_eq!(unescape("%0A%25%0D"), Ok("\n%\r".to_string()));
+    fn decodes_what_the_client_encodes() {
+        assert_eq!(decode_path("foo.typ"), Ok("foo.typ".to_string()));
+        assert_eq!(decode_path("."), Ok(".".to_string()));
+        assert_eq!(decode_path(""), Ok("".to_string()));
+        assert_eq!(decode_path("inc%2Fheader.typ"), Ok("inc/header.typ".to_string()));
+        assert_eq!(decode_path("we%0Aird.typ"), Ok("we\nird.typ".to_string()));
+        assert_eq!(decode_path("we%0Dird.typ"), Ok("we\rird.typ".to_string()));
+        assert_eq!(decode_path("a%25b.typ"), Ok("a%b.typ".to_string()));
+        assert_eq!(decode_path("a%20b.typ"), Ok("a b.typ".to_string()));
+        assert_eq!(decode_path("h%C3%A9ader.typ"), Ok("héader.typ".to_string()));
     }
 
     #[test]
-    fn leaves_everything_else_alone() {
-        assert_eq!(unescape("inc/header.typ"), Ok("inc/header.typ".to_string()));
-        assert_eq!(unescape("."), Ok(".".to_string()));
-        assert_eq!(unescape(""), Ok("".to_string()));
-        // Spaces need no escaping: the id is split off at the first one
-        assert_eq!(unescape("a b.typ"), Ok("a b.typ".to_string()));
-        // Multi-byte characters pass through, and can also be escaped byte by byte
-        assert_eq!(unescape("héader.typ"), Ok("héader.typ".to_string()));
-        assert_eq!(unescape("h%C3%A9ader.typ"), Ok("héader.typ".to_string()));
-    }
-
-    #[test]
-    fn rejects_an_escape_it_cannot_decode() {
-        assert_eq!(unescape("bad%ZZ.typ"), Err("bad escape"));
-        assert_eq!(unescape("truncated%0"), Err("truncated escape"));
-        assert_eq!(unescape("truncated%"), Err("truncated escape"));
-        // A byte sequence that isn't UTF-8 once decoded
-        assert_eq!(unescape("%FF%FE"), Err("escaped path wasn't utf-8"));
+    fn refuses_bytes_that_are_not_utf8_once_decoded() {
+        assert_eq!(decode_path("%FF%FE"), Err("path wasn't utf-8 once decoded"));
     }
 }
