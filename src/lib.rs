@@ -26,7 +26,6 @@ pub mod fuse9p;
 pub mod mount9p;
 pub mod ninep;
 pub mod transport;
-mod write_pipeline;
 
 pub use client::NineClient;
 pub use fuse9p::{Fuse9p, Tuning};
