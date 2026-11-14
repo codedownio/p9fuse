@@ -46,12 +46,17 @@
         packages.default = p9fuse;
         packages.p9fuse = p9fuse;
 
-        # `nix flake check` runs all of these: build, clippy (-D warnings), and rustfmt.
+        # `nix flake check` runs all of these: build, clippy (-D warnings), docs (-D warnings), and
+        # rustfmt.
         checks = {
           inherit p9fuse;
           clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;
             cargoClippyExtraArgs = "--all-targets -- -D warnings";
+          });
+          doc = craneLib.cargoDoc (commonArgs // {
+            inherit cargoArtifacts;
+            RUSTDOCFLAGS = "-D warnings";
           });
           fmt = craneLib.cargoFmt { inherit (commonArgs) src; };
         };

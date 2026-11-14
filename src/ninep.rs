@@ -212,9 +212,9 @@ impl<'a> R<'a> {
     }
 }
 
-/// Parse an Rgetattr body. Layout: valid[8] qid[13] mode[4] uid[4] gid[4] nlink[8] rdev[8] size[8]
-/// blksize[8] blocks[8] atime(sec,nsec) mtime(sec,nsec) ctime(sec,nsec) btime(sec,nsec) gen[8]
-/// data_version[8]. We stop after ctime since that's all FUSE consumes.
+/// Parse an Rgetattr body. Layout: `valid[8] qid[13] mode[4] uid[4] gid[4] nlink[8] rdev[8]
+/// size[8] blksize[8] blocks[8] atime(sec,nsec) mtime(sec,nsec) ctime(sec,nsec) btime(sec,nsec)
+/// gen[8] data_version[8]`. We stop after ctime since that's all FUSE consumes.
 pub fn parse_getattr(body: &[u8]) -> Option<Attr> {
     let mut r = R::new(body);
     let _valid = r.u64()?;
@@ -246,7 +246,8 @@ pub fn parse_getattr(body: &[u8]) -> Option<Attr> {
     })
 }
 
-/// Parse the packed Rreaddir data blob into entries. Each entry: qid[13] offset[8] type[1] name[s].
+/// Parse the packed Rreaddir data blob into entries. Each entry:
+/// `qid[13] offset[8] type[1] name[s]`.
 pub fn parse_readdir(data: &[u8]) -> Vec<DirEntry> {
     let mut r = R::new(data);
     let mut out = Vec::new();
