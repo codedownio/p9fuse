@@ -107,47 +107,69 @@ struct Diod {
 }
 
 impl Diod {
-    // The child is reaped in `Drop` (kill + wait); clippy can't see through the struct.
-    #[allow(clippy::zombie_processes)]
+    /// Start diod on a free port. The port is only free when we look: another test may take it
+    /// before diod binds it, so wait for diod itself to say it is listening, and try another port
+    /// if it couldn't bind.
     fn start() -> Diod {
         let diod = find_diod().expect("diod (checked by skip_reason)");
         let export = tempfile::tempdir().unwrap();
-        let port = free_port();
-        let child = Command::new(&diod)
-            .args([
-                "-f", // foreground
-                "-n", // no auth
-                "-N", // bypass userdb, so a rootless diod needs no passwd/group entry for our uid
-                "-L",
-                "stderr",
-                "-l",
-                &format!("127.0.0.1:{port}"),
-                "-e",
-                export.path().to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn diod");
-
-        // Wait for diod to accept connections before anyone attaches.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        for _ in 0..20 {
+            let port = free_port();
+            let mut child = Command::new(&diod)
+                .args([
+                    "-f", // foreground
+                    "-n", // no auth
+                    "-N", // bypass userdb, so a rootless diod needs no passwd/group entry for our uid
+                    "-L",
+                    "stderr",
+                    "-l",
+                    &format!("127.0.0.1:{port}"),
+                    "-e",
+                    export.path().to_str().unwrap(),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn diod");
+            if diod_listening(&mut child) {
                 return Diod {
                     child,
                     export,
                     port,
                 };
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        panic!("diod did not start listening on 127.0.0.1:{port}");
+        panic!("diod could not start listening on a free port");
     }
 
     fn export(&self) -> &Path {
         self.export.path()
     }
+}
+
+/// Read diod's log until it says it is listening (true) or exits without doing so (false). The rest
+/// of the log is drained in the background so diod never blocks writing it.
+fn diod_listening(child: &mut Child) -> bool {
+    let stderr = child.stderr.take().expect("diod stderr piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = std::io::BufReader::new(stderr).lines();
+        for line in lines.by_ref() {
+            match line {
+                Ok(l) if l.starts_with("Listening on ") => {
+                    let _ = tx.send(true);
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(false);
+        for _ in lines {}
+    });
+    rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
 }
 
 impl Drop for Diod {
@@ -157,19 +179,47 @@ impl Drop for Diod {
     }
 }
 
+/// Unmount `mp`. Retries for a few seconds first: a desktop service probing new mounts (GNOME's
+/// gvfsd-trash looks up a trash folder in each one) holds the mount busy while its lookup is in
+/// flight. Then falls back to a lazy unmount, which detaches the mount at once.
 fn umount(mp: &Path) {
-    if let Some(bin) = fusermount_bin() {
-        let ok = Command::new(bin)
-            .arg("-u")
+    let Some(bin) = fusermount_bin() else {
+        let _ = Command::new("umount").arg(mp).status();
+        return;
+    };
+    let run = |args: &[&str]| {
+        Command::new(bin)
+            .args(args)
             .arg(mp)
+            .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
+            .is_ok_and(|s| s.success())
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if run(&["-u"]) {
             return;
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = Command::new("umount").arg(mp).status();
+    if !run(&["-u", "-z"]) {
+        eprintln!("couldn't unmount {}", mp.display());
+    }
+}
+
+/// Unmount `mp` and wait for its mount task to end, failing instead of hanging if it doesn't.
+async fn unmount_and_join(
+    mp: &Path,
+    task: tokio::task::JoinHandle<Result<(), String>>,
+) -> Result<(), String> {
+    umount(mp);
+    match tokio::time::timeout(Duration::from_secs(30), task).await {
+        Ok(joined) => joined.expect("mount task join"),
+        Err(_) => panic!(
+            "mount of {} still running 30s after unmounting",
+            mp.display()
+        ),
+    }
 }
 
 /// Which transport to reach diod through. Non-TCP transports use a tiny in-test relay that bridges
@@ -360,9 +410,12 @@ where
         if tokio::fs::try_exists(&ready_path).await.unwrap_or(false) {
             break;
         }
+        if task.is_finished() {
+            let result = task.await.expect("mount task join");
+            panic!("mount ended before it became ready: {result:?}");
+        }
         if Instant::now() >= deadline {
-            umount(&mp);
-            let _ = task.await;
+            let _ = unmount_and_join(&mp, task).await;
             panic!("mount did not become ready within 15s");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -379,8 +432,7 @@ where
     })
     .await;
 
-    umount(&mp);
-    let mount_result = task.await.expect("mount task join");
+    let mount_result = unmount_and_join(&mp, task).await;
     for h in relays {
         h.abort();
     }
