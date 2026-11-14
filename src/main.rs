@@ -68,7 +68,7 @@ enum Cmd {
         headers: Vec<String>,
         /// 9p msize (max message size) in bytes.
         #[arg(long, default_value_t = 512000)]
-        msize: usize,
+        msize: u32,
         /// Attach (n_uname) as this uid -- the user the server should act as for file ops.
         #[arg(long, default_value_t = 1000)]
         uid: u32,
@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fuse9p::Fuse9p::run(
                 transport,
                 &mountpoint,
-                msize as u32,
+                msize,
                 uid,
                 &aname,
                 tuning,

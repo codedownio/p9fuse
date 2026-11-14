@@ -214,6 +214,7 @@ impl NineClient {
     /// Send a T-message body and await the matching response. Returns Err(errno) on Rlerror or a
     /// transport/protocol failure (mapped to EIO).
     async fn transact(&self, mtype: u8, tag: u16, body: &[u8]) -> Result<Frame, i32> {
+        let size = u32::try_from(4 + 1 + 2 + body.len()).map_err(|_| libc::EMSGSIZE)?;
         let (tx, rx) = oneshot::channel();
         let displaced = self.pending.lock().unwrap().insert(
             tag,
@@ -236,7 +237,6 @@ impl NineClient {
             );
         }
 
-        let size = (4 + 1 + 2 + body.len()) as u32;
         let mut frame = Vec::with_capacity(size as usize);
         frame.extend_from_slice(&size.to_le_bytes());
         frame.push(mtype);
@@ -254,8 +254,8 @@ impl NineClient {
         match rx.await {
             Ok(resp) => {
                 if resp.typ == RLERROR {
-                    let ecode = R::new(&resp.body).u32().unwrap_or(libc::EIO as u32);
-                    Err(ecode as i32)
+                    let ecode = R::new(&resp.body).u32().and_then(|e| i32::try_from(e).ok());
+                    Err(ecode.unwrap_or(libc::EIO))
                 } else {
                     Ok(resp)
                 }
@@ -330,7 +330,8 @@ impl NineClient {
     /// that short reply is mapped to ENOENT here to keep the rule "Err means no fid" exact.
     pub async fn walk(&self, fid: u32, newfid: u32, names: &[&str]) -> Result<Vec<Qid>, i32> {
         let mut w = W::new();
-        w.u32(fid).u32(newfid).u16(names.len() as u16);
+        let count = u16::try_from(names.len()).map_err(|_| libc::EINVAL)?;
+        w.u32(fid).u32(newfid).u16(count);
         for n in names {
             w.str(n);
         }
@@ -437,7 +438,8 @@ impl NineClient {
 
     pub async fn write(&self, fid: u32, offset: u64, data: &[u8]) -> Result<u32, i32> {
         let mut w = W::new();
-        w.u32(fid).u64(offset).u32(data.len() as u32).bytes(data);
+        let count = u32::try_from(data.len()).map_err(|_| libc::EINVAL)?;
+        w.u32(fid).u64(offset).u32(count).bytes(data);
         let body = self.req(TWRITE, RWRITE, &w.buf).await?;
         R::new(&body).u32().ok_or(libc::EIO)
     }

@@ -160,8 +160,9 @@ impl Filesystem for Fuse9p {
     ) {
         let fid = or_reply!(reply, self.handle(fh)).fid;
         self.settle_writes(Some(ino));
+        let offset = or_reply!(reply, file_offset(offset));
         let size = size.min(self.io_chunk());
-        let data = read_full(&self.client, fid, offset as u64, size);
+        let data = read_full(&self.client, fid, offset, size);
         let data = or_reply!(reply, self.rt.block_on(data));
         reply.data(&data);
     }
@@ -178,13 +179,15 @@ impl Filesystem for Fuse9p {
         _lock: Option<u64>,
         reply: ReplyWrite,
     ) {
+        let offset = or_reply!(reply, file_offset(offset));
+        let len = or_reply!(reply, u32::try_from(data.len()).map_err(|_| libc::EINVAL));
         let h = or_reply!(reply, self.handle(fh));
         let (fid, ino, err) = (h.fid, h.ino, h.write_error.clone());
         match (err, self.writes.get(&ino).cloned()) {
             (Some(err), Some(pipeline)) => {
                 let w = Write {
                     fid,
-                    off: offset as u64,
+                    off: offset,
                     data: data.to_vec(),
                     err,
                 };
@@ -194,11 +197,11 @@ impl Filesystem for Fuse9p {
                 // After the pipelined writes to the same file.
                 self.settle_writes(Some(ino));
                 let chunk = self.io_chunk() as usize;
-                let written = write_all(&self.client, fid, offset as u64, data, chunk);
+                let written = write_all(&self.client, fid, offset, data, chunk);
                 or_reply!(reply, self.rt.block_on(written));
             }
         }
-        reply.written(data.len() as u32);
+        reply.written(len);
     }
 
     fn flush(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _lock: u64, reply: ReplyEmpty) {
@@ -292,12 +295,14 @@ impl Filesystem for Fuse9p {
         mut reply: ReplyDirectory,
     ) {
         let fid = or_reply!(reply, self.handle(fh)).fid;
-        let entries = self.client.readdir(fid, offset as u64, READDIR_BYTES);
+        let entries = self
+            .client
+            .readdir(fid, offset.cast_unsigned(), READDIR_BYTES);
         for e in or_reply!(reply, self.rt.block_on(entries)) {
             // An entry's offset is where to continue after it. `add` is true once the buffer is full.
             if reply.add(
                 self.ino(&e.qid),
-                e.offset as i64,
+                e.offset.cast_signed(),
                 kind_from_qid(e.qid.typ),
                 &e.name,
             ) {
@@ -318,7 +323,9 @@ impl Filesystem for Fuse9p {
     ) {
         let open_fid = or_reply!(reply, self.handle(fh)).fid;
         let dir_fid = or_reply!(reply, self.fid_of(ino));
-        let entries = self.client.readdir(open_fid, offset as u64, READDIR_BYTES);
+        let entries = self
+            .client
+            .readdir(open_fid, offset.cast_unsigned(), READDIR_BYTES);
         let entries = or_reply!(reply, self.rt.block_on(entries));
         // The sizes must include writes we have acknowledged but not sent yet.
         self.settle_writes(None);
@@ -337,7 +344,7 @@ impl Filesystem for Fuse9p {
             let ttl = self.tuning.entry_ttl;
             // `add` is true once the buffer is full; the kernel only takes a lookup reference to
             // entries that fit.
-            full = full || reply.add(ino, e.offset as i64, &e.name, &ttl, &attr, 0);
+            full = full || reply.add(ino, e.offset.cast_signed(), &e.name, &ttl, &attr, 0);
             if full {
                 self.clunk(fid);
             } else {
@@ -490,14 +497,20 @@ async fn walk_attr(client: &NineClient, dir: u32, name: &str) -> Option<(u32, At
 /// file to the application (SQLite then fails with "disk I/O error"), so keep reading.
 async fn read_full(client: &NineClient, fid: u32, off: u64, size: u32) -> Result<Vec<u8>, i32> {
     let mut out = Vec::new();
-    while (out.len() as u32) < size {
-        let chunk = client
-            .read(fid, off + out.len() as u64, size - out.len() as u32)
-            .await?;
+    let mut remaining = size;
+    while remaining > 0 {
+        let chunk = client.read(fid, off + out.len() as u64, remaining).await?;
         if chunk.is_empty() {
             break;
         }
+        let n = u32::try_from(chunk.len()).map_err(|_| libc::EIO)?;
+        remaining = remaining.checked_sub(n).ok_or(libc::EIO)?;
         out.extend_from_slice(&chunk);
     }
     Ok(out)
+}
+
+/// A read or write offset from the kernel, which never sends a negative one.
+fn file_offset(offset: i64) -> Result<u64, i32> {
+    u64::try_from(offset).map_err(|_| libc::EINVAL)
 }

@@ -288,7 +288,7 @@ mod tests {
 
     /// Build a frame: size[4] type[1] tag[2] + body.
     fn frame(typ: u8, tag: u16, body: &[u8]) -> Vec<u8> {
-        let size = (7 + body.len()) as u32;
+        let size = u32::try_from(7 + body.len()).unwrap();
         let mut f = size.to_le_bytes().to_vec();
         f.push(typ);
         f.extend_from_slice(&tag.to_le_bytes());

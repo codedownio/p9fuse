@@ -97,7 +97,7 @@ impl FdTransport {
         }
 
         let mut domain: libc::c_int = 0;
-        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+        let mut len = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap();
         let rc = libc::getsockopt(
             fd,
             libc::SOL_SOCKET,
