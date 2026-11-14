@@ -713,6 +713,42 @@ async fn external_growth_with_pinned_inode() {
     .await;
 }
 
+/// Invalidating paths deeper than one `Twalk` can carry (16 names), existing or not, works and
+/// doesn't break the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidate_deep_path() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP invalidate_deep_path: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |mut m| {
+        let dir = "d/".repeat(20);
+        std::fs::create_dir_all(m.export.join(&dir)).unwrap();
+        std::fs::write(m.export.join(format!("{dir}f")), b"old").unwrap();
+        assert_eq!(std::fs::read(m.mp.join(format!("{dir}f"))).unwrap(), b"old");
+
+        std::fs::write(m.export.join(format!("{dir}f")), b"new").unwrap();
+        writeln!(m.inval, "inval 1 {dir}f").unwrap();
+        let mut reply = String::new();
+        std::io::BufReader::new(&m.inval)
+            .read_line(&mut reply)
+            .unwrap();
+        assert_eq!(reply, "ok 1\n");
+
+        assert_eq!(std::fs::read(m.mp.join(format!("{dir}f"))).unwrap(), b"new");
+
+        // Fails in the second Twalk, after the first has established the fid.
+        writeln!(m.inval, "inval 2 {dir}missing/{dir}f").unwrap();
+        let mut reply = String::new();
+        std::io::BufReader::new(&m.inval)
+            .read_line(&mut reply)
+            .unwrap();
+        assert_eq!(reply, "ok 2\n");
+        assert_eq!(std::fs::read(m.mp.join(format!("{dir}f"))).unwrap(), b"new");
+    })
+    .await;
+}
+
 /// `stat` and a read through a second fd see every write made so far on a still-open writer, even
 /// though the write pipeline has acknowledged writes the server may not have yet. Without the
 /// writeback cache the kernel takes size and data from us, so we have to wait for those writes.

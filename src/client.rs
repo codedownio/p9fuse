@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 const NOTAG: u16 = 0xffff;
+/// The most names one Twalk may carry (MAXWELEM in the 9p spec).
+const MAX_WALK_NAMES: usize = 16;
 const ROOT_FID: u32 = 1;
 
 /// A decoded response frame: message type plus the body after the 7-byte header.
@@ -319,16 +321,34 @@ impl NineClient {
             .ok_or_else(|| to_io("short Rattach").into())
     }
 
-    /// Walk `names` from `fid` into the fresh `newfid`. `names` empty clones the fid (newfid points
-    /// at the same file). Returns the walked qids (one per name).
-    /// Walk `names` from `fid` to `newfid`.
+    /// Walk `names` from `fid` to `newfid`; no names makes `newfid` a copy of `fid`. Returns one
+    /// qid per name.
     ///
     /// On `Ok`, `newfid` is established on the server and belongs to the caller, who must clunk it
     /// when done. On `Err` it is not, and clunking it is a protocol error the server answers with
-    /// EIO: 9P2000 leaves `newfid` untouched unless the walk completes in full. A server reports a
-    /// name that did not resolve by returning fewer qids than asked for rather than an Rlerror, so
-    /// that short reply is mapped to ENOENT here to keep the rule "Err means no fid" exact.
+    /// EIO.
     pub async fn walk(&self, fid: u32, newfid: u32, names: &[&str]) -> Result<Vec<Qid>, i32> {
+        // A Twalk carries at most MAX_WALK_NAMES names, so walk the rest from newfid in place.
+        let mut chunks = names.chunks(MAX_WALK_NAMES);
+        let mut qids = self
+            .walk_once(fid, newfid, chunks.next().unwrap_or(&[]))
+            .await?;
+        for chunk in chunks {
+            match self.walk_once(newfid, newfid, chunk).await {
+                Ok(more) => qids.extend(more),
+                Err(e) => {
+                    let _ = self.clunk(newfid).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(qids)
+    }
+
+    /// One Twalk. 9P2000 leaves `newfid` untouched unless the walk completes in full. A server
+    /// reports a name that did not resolve by returning fewer qids than asked for rather than an
+    /// Rlerror, so that short reply is mapped to ENOENT to keep the rule "Err means no fid" exact.
+    async fn walk_once(&self, fid: u32, newfid: u32, names: &[&str]) -> Result<Vec<Qid>, i32> {
         let mut w = W::new();
         w.u32(fid).u32(newfid).u16(names.len() as u16);
         for n in names {
