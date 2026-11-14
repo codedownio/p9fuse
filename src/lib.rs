@@ -26,6 +26,7 @@ pub mod fuse9p;
 pub mod mount9p;
 pub mod ninep;
 pub mod transport;
+mod write_pipeline;
 
 pub use client::NineClient;
 pub use fuse9p::{Fuse9p, Tuning};
@@ -42,6 +43,9 @@ use std::path::Path;
 /// - `uid` is the identity to attach as (`n_uname`); the server acts as this user for file ops.
 /// - `aname` is the export name to attach (must match the server's export, e.g. `"/export"`).
 /// - `tuning` controls the caching / write-back knobs (see [`Tuning`]).
+///
+/// Invalidation requests are read from the process's stdin and answered on its stdout; use
+/// [`mount_with_invalidations`] to use other streams.
 pub async fn mount(
     transport: Box<dyn NineTransport>,
     mountpoint: &Path,
@@ -49,6 +53,34 @@ pub async fn mount(
     uid: u32,
     aname: &str,
     tuning: Tuning,
+) -> Result<(), Box<dyn std::error::Error>> {
+    mount_with_invalidations(
+        transport,
+        mountpoint,
+        msize,
+        uid,
+        aname,
+        tuning,
+        Box::new(tokio::io::stdin()),
+        Box::new(tokio::io::stdout()),
+    )
+    .await
+}
+
+/// Like [`mount`], but reads invalidation requests from `invalidations` and writes their replies to
+/// `replies`. Each request names a path relative to the mount root and drops its cached entry,
+/// attributes and data from the kernel, so the next access sees changes made to the export from
+/// outside the mount; its reply is written once that is done.
+#[allow(clippy::too_many_arguments)]
+pub async fn mount_with_invalidations(
+    transport: Box<dyn NineTransport>,
+    mountpoint: &Path,
+    msize: u32,
+    uid: u32,
+    aname: &str,
+    tuning: Tuning,
+    invalidations: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    replies: Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Fuse9p::run(
         transport,
@@ -60,6 +92,8 @@ pub async fn mount(
         true,
         true,
         std::time::Duration::from_secs(30),
+        invalidations,
+        replies,
     )
     .await
 }

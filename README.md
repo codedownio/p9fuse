@@ -89,8 +89,9 @@ multiple clients write concurrently.
 | `attr_ttl` | 60s | How long the kernel trusts a cached `getattr`. `0` = round-trip every stat. |
 | `entry_ttl` | 60s | How long the kernel trusts a cached name→inode lookup. |
 | `negative_ttl` | 5s | Cache "no such file" lookups (skip round-trips on `$PATH`/include probes). |
-| `writeback` | on | Pipeline writes via the FUSE writeback cache instead of one round-trip per write. |
-| `wb_depth` | 16 | Max in-flight `Twrite`s per open file when write-back is on. |
+| `write_pipeline` | on | Acknowledge writes at once and send their `Twrite`s in the background instead of one round-trip per write. Overlapping writes stay in order; adjacent small writes are merged while the pipeline is full. |
+| `wb_depth` | 16 | Max in-flight `Twrite`s per file when the write pipeline is on. |
+| `writeback_cache` | off | Let the kernel buffer writes in its page cache. Faster for small writes, but only safe when nothing else writes to the export: the kernel then keeps its own file sizes, so a file grown from outside the mount reads back truncated while its inode is cached, even after invalidation. |
 | `readdirplus` | off | Prefetch entry attrs on `readdir`. Off by default — usually net-negative. |
 
 ## Custom transports
