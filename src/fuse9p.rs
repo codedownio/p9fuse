@@ -444,7 +444,12 @@ async fn invalidation_loop(
                 match decode_path(escaped) {
                     Ok(p) => (Some(id.to_string()), p),
                     Err(e) => {
-                        tracing::warn!(id, escaped, e, "mount9p-fuse: undecodable invalidation path");
+                        tracing::warn!(
+                            id,
+                            escaped,
+                            e,
+                            "mount9p-fuse: undecodable invalidation path"
+                        );
                         reply(&mut out, &format!("err {id} {e}")).await;
                         continue;
                     }
@@ -1352,7 +1357,10 @@ mod tests {
         assert_eq!(decode_path("foo.typ"), Ok("foo.typ".to_string()));
         assert_eq!(decode_path("."), Ok(".".to_string()));
         assert_eq!(decode_path(""), Ok("".to_string()));
-        assert_eq!(decode_path("inc%2Fheader.typ"), Ok("inc/header.typ".to_string()));
+        assert_eq!(
+            decode_path("inc%2Fheader.typ"),
+            Ok("inc/header.typ".to_string())
+        );
         assert_eq!(decode_path("we%0Aird.typ"), Ok("we\nird.typ".to_string()));
         assert_eq!(decode_path("we%0Dird.typ"), Ok("we\rird.typ".to_string()));
         assert_eq!(decode_path("a%25b.typ"), Ok("a%b.typ".to_string()));
