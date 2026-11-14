@@ -1,5 +1,7 @@
 //! Pipelined writes for one inode. A FUSE `write` is acknowledged as soon as it is queued here; the
-//! `Twrite`s go out from background tasks, up to `depth` at a time.
+//! `Twrite`s go out from background tasks, up to `depth` at a time. A write never overtakes an
+//! earlier write it overlaps: the server may apply concurrent `Twrite`s in any order, so a write
+//! waits for every overlapping write still in flight before it is sent.
 //!
 //! The FUSE session calls `write` and `settle` from one thread at a time, so only the background
 //! tasks run concurrently with them.
@@ -18,6 +20,12 @@ pub(crate) struct Write {
     pub off: u64,
     pub data: Vec<u8>,
     pub err: WriteError,
+}
+
+impl Write {
+    fn end(&self) -> u64 {
+        self.off + self.data.len() as u64
+    }
 }
 
 /// The write pipeline of one inode, shared by all its open handles.
@@ -39,6 +47,8 @@ struct State {
 
 struct InFlight {
     id: u64,
+    start: u64,
+    end: u64,
     /// Its sender is dropped when the write finishes, which wakes everything waiting on it.
     done: watch::Receiver<()>,
 }
@@ -87,12 +97,16 @@ impl InodeWrites {
     fn start(self: &Arc<Self>, permit: OwnedSemaphorePermit, w: Write) {
         let started = {
             let mut st = self.state.lock().unwrap();
-            register(&mut st)
+            register(&mut st, &w)
         };
         tokio::spawn(self.clone().run(permit, w, started));
     }
 
+    /// Send `w` once the writes it overlaps have finished.
     async fn run(self: Arc<Self>, permit: OwnedSemaphorePermit, w: Write, started: Started) {
+        for mut done in started.waits {
+            let _ = done.changed().await;
+        }
         if let Err(e) = write_all(&self.client, w.fid, w.off, &w.data, self.chunk).await {
             w.err.lock().unwrap().get_or_insert(e);
         }
@@ -105,18 +119,35 @@ impl InodeWrites {
     }
 }
 
-/// A write just added to `inflight`: its id and the sender whose drop marks it finished.
+/// A write just added to `inflight`: its id, the overlapping writes it must wait for, and the
+/// sender whose drop marks it finished.
 struct Started {
     id: u64,
+    waits: Vec<watch::Receiver<()>>,
     _done: watch::Sender<()>,
 }
 
-fn register(st: &mut State) -> Started {
+fn register(st: &mut State, w: &Write) -> Started {
+    let waits = st
+        .inflight
+        .iter()
+        .filter(|f| f.start < w.end() && w.off < f.end)
+        .map(|f| f.done.clone())
+        .collect();
     let (tx, rx) = watch::channel(());
     let id = st.next_id;
     st.next_id += 1;
-    st.inflight.push(InFlight { id, done: rx });
-    Started { id, _done: tx }
+    st.inflight.push(InFlight {
+        id,
+        start: w.off,
+        end: w.end(),
+        done: rx,
+    });
+    Started {
+        id,
+        waits,
+        _done: tx,
+    }
 }
 
 /// Write `data` to `fid` starting at byte `off`, split into `chunk`-sized `Twrite`s. A short write of

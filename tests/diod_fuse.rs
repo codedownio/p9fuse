@@ -826,6 +826,177 @@ async fn offset_writes() {
     }
 }
 
+/// The write modes: the default (pipeline, no kernel cache), the same with a pipeline one write
+/// deep, pipeline plus kernel writeback cache, and fully synchronous writes.
+fn write_modes() -> [(&'static str, Tuning); 4] {
+    [
+        ("pipeline", Tuning::default()),
+        (
+            "pipeline depth 1",
+            Tuning {
+                wb_depth: 1,
+                ..Tuning::default()
+            },
+        ),
+        (
+            "pipeline+cache",
+            Tuning {
+                writeback_cache: true,
+                ..Tuning::default()
+            },
+        ),
+        (
+            "sync",
+            Tuning {
+                write_pipeline: false,
+                ..Tuning::default()
+            },
+        ),
+    ]
+}
+
+/// A small deterministic PRNG (xorshift64*), so the randomized tests need no extra dependency and
+/// a failure reproduces.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// Many O_APPEND writes land at end-of-file in the order they were made, in every write mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn append_writes() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP append_writes: {reason}");
+        return;
+    }
+    for (mode, tuning) in write_modes() {
+        with_mount(tuning, move |mp| {
+            use std::io::Write;
+            let p = mp.join("a");
+            std::fs::write(&p, b"start:").unwrap();
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            let mut expected = b"start:".to_vec();
+            for i in 0..64u8 {
+                let chunk = [b'A' + i % 26; 8192];
+                f.write_all(&chunk).unwrap();
+                expected.extend_from_slice(&chunk);
+            }
+            drop(f);
+
+            let got = std::fs::read(&p).unwrap();
+            assert!(got == expected, "{mode}: appends out of order or lost");
+        })
+        .await;
+    }
+}
+
+/// Rewriting the same region over and over leaves the last write's data, in every write mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_writes_keep_order() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP overlapping_writes_keep_order: {reason}");
+        return;
+    }
+    for (mode, tuning) in write_modes() {
+        with_mount(tuning, move |mp| {
+            use std::os::unix::fs::FileExt;
+            for trial in 0..10 {
+                let p = mp.join(format!("o{trial}"));
+                let f = std::fs::File::create(&p).unwrap();
+                for i in 0..64u8 {
+                    f.write_all_at(&[i; 262_144], 0).unwrap();
+                }
+                drop(f);
+
+                let got = std::fs::read(&p).unwrap();
+                assert!(
+                    got == [63u8; 262_144],
+                    "{mode}: trial {trial}: an older write won"
+                );
+            }
+        })
+        .await;
+    }
+}
+
+/// Random writes (small and large, overlapping, through two handles on the same file), truncates
+/// and mid-way stat/read checks all agree with an in-memory copy of the file, in every write mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn random_writes_match_model() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP random_writes_match_model: {reason}");
+        return;
+    }
+    for (mode, tuning) in write_modes() {
+        with_mount(tuning, move |mp| {
+            use std::os::unix::fs::FileExt;
+            let p = mp.join("r");
+            let a = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&p)
+                .unwrap();
+            let b = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            let mut model: Vec<u8> = Vec::new();
+            let mut rng = Rng(0x9E3779B97F4A7C15);
+            for step in 0..3000u32 {
+                let f = if rng.below(4) == 0 { &b } else { &a };
+                match rng.below(40) {
+                    0 => {
+                        let len = rng.below(300_000) as usize;
+                        f.set_len(len as u64).unwrap();
+                        model.resize(len, 0);
+                    }
+                    1 | 2 => {
+                        let size = std::fs::metadata(&p).unwrap().len();
+                        let got = std::fs::read(&p).unwrap();
+                        assert_eq!(size, model.len() as u64, "{mode}: step {step}: stat size");
+                        assert!(got == model, "{mode}: step {step}: contents differ");
+                    }
+                    _ => {
+                        // Mostly runs of small sequential writes, with some big ones and jumps.
+                        let off = if rng.below(3) == 0 {
+                            rng.below(262_144) as usize
+                        } else {
+                            model.len().min(262_144)
+                        };
+                        let len = 1 + if rng.below(5) == 0 {
+                            rng.below(131_072)
+                        } else {
+                            rng.below(4096)
+                        } as usize;
+                        let data: Vec<u8> = (0..len).map(|i| (step as usize + i) as u8).collect();
+                        f.write_all_at(&data, off as u64).unwrap();
+                        if model.len() < off + len {
+                            model.resize(off + len, 0);
+                        }
+                        model[off..off + len].copy_from_slice(&data);
+                    }
+                }
+            }
+            drop(a);
+            drop(b);
+
+            let got = std::fs::read(&p).unwrap();
+            assert_eq!(got.len(), model.len(), "{mode}: final size");
+            assert!(got == model, "{mode}: final contents differ");
+        })
+        .await;
+    }
+}
+
 /// A directory with enough entries to span multiple `Treaddir` round-trips lists every entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_directory_readdir() {

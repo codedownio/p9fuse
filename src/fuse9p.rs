@@ -52,8 +52,9 @@ pub struct Tuning {
     pub writeback_cache: bool,
     /// Pipeline writes: acknowledge each FUSE `write` at once and send its `Twrite` from a background
     /// task, up to `wb_depth` in flight per file, turning latency-bound sequential writes into
-    /// throughput. Errors surface at flush/fsync/release. Off = each `write` is one synchronous
-    /// `Twrite` round-trip.
+    /// throughput. A write waits for overlapping writes still in flight. Errors surface at
+    /// flush/fsync/release. Off = each `write` is one synchronous `Twrite` round-trip. O_APPEND
+    /// handles write synchronously unless `writeback_cache` is on.
     pub write_pipeline: bool,
     /// Max concurrent in-flight `Twrite`s per file when `write_pipeline` is on. Bounds memory
     /// (~`wb_depth` * msize) and sets the pipeline depth.
@@ -141,13 +142,24 @@ impl Fuse9p {
     fn open_flags(&self, flags: i32) -> (u32, bool) {
         let mut oflags = (flags as u32) & !(libc::O_CLOEXEC as u32);
         let acc = oflags & libc::O_ACCMODE as u32;
-        // With the FUSE writeback cache the kernel issues READs on the handle for partial-page
-        // read-modify-write even when the file was opened write-only, which the server would
-        // refuse with EBADF on a write-only fid; so open those read-write.
-        if self.tuning.writeback_cache && acc == libc::O_WRONLY as u32 {
-            oflags = (oflags & !(libc::O_ACCMODE as u32)) | libc::O_RDWR as u32;
+        let append = oflags & libc::O_APPEND as u32 != 0;
+        if self.tuning.writeback_cache {
+            // With the FUSE writeback cache the kernel issues READs on the handle for partial-page
+            // read-modify-write even when the file was opened write-only, which the server would
+            // refuse with EBADF on a write-only fid; so open those read-write. The kernel also
+            // places O_APPEND writes itself and may write back any dirty page through any of the
+            // file's handles, so the server must honour our offsets: drop O_APPEND.
+            if acc == libc::O_WRONLY as u32 {
+                oflags = (oflags & !(libc::O_ACCMODE as u32)) | libc::O_RDWR as u32;
+            }
+            oflags &= !(libc::O_APPEND as u32);
         }
-        let pipelined = acc != libc::O_RDONLY as u32 && self.tuning.write_pipeline;
+        // Without the cache an O_APPEND fid stays O_APPEND, so the server appends at its real end
+        // of file -- but then it ignores our offsets, and two appends in flight could land in either
+        // order. Those handles write synchronously.
+        let writable = acc != libc::O_RDONLY as u32;
+        let pipelined =
+            writable && self.tuning.write_pipeline && (self.tuning.writeback_cache || !append);
         (oflags, pipelined)
     }
 
