@@ -137,8 +137,15 @@ enum Cmd {
     MakeShared { path: PathBuf },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(run());
+    // Reading stdin ties up a thread until stdin closes, which may never happen. Don't wait for it.
+    runtime.shutdown_background();
+    result
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Log to stderr: stdin/stdout are protocol channels (invalidation paths arrive on stdin), so
     // stdout must stay clean.
     tracing_subscriber::fmt()

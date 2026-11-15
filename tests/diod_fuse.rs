@@ -1217,3 +1217,57 @@ async fn error_paths() {
     })
     .await;
 }
+
+/// The binary exits once unmounted, even while whoever started it keeps its stdin open.
+#[test]
+fn binary_exits_after_unmount_with_stdin_open() {
+    if let Some(why) = skip_reason() {
+        eprintln!("skipping: {why}");
+        return;
+    }
+    let diod = Diod::start();
+    std::fs::write(diod.export().join(READY), b"1").unwrap();
+    let mountpoint = tempfile::tempdir().unwrap();
+    let mp = mountpoint.path();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_p9fuse"))
+        .arg("mount9p-fuse")
+        .arg(format!("--connect=tcp://127.0.0.1:{}", diod.port))
+        .arg(format!("--uid={}", nix::unistd::geteuid()))
+        .arg("--aname")
+        .arg(diod.export())
+        .arg(mp)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn p9fuse");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !mp.join(READY).exists() {
+        assert!(child.try_wait().unwrap().is_none(), "p9fuse exited early");
+        assert!(Instant::now() < deadline, "mount did not become ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let conn = fuse_connection(mp);
+
+    umount(mp);
+    let exited = |child: &mut Child, secs| {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    };
+    let status = exited(&mut child, 5).or_else(|| {
+        abort_connection(conn);
+        exited(&mut child, 10)
+    });
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("p9fuse still running 15s after unmounting");
+    };
+    assert!(status.success(), "p9fuse exited with {status}");
+}
