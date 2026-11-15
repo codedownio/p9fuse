@@ -134,7 +134,7 @@ impl Diod {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn diod");
-            if diod_listening(&mut child) {
+            if diod_listening(&mut child) && accepting(port) {
                 return Diod {
                     child,
                     export,
@@ -173,6 +173,19 @@ fn diod_listening(child: &mut Child) -> bool {
         for _ in lines {}
     });
     rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
+}
+
+/// Wait until a connection to `port` succeeds. diod logs that it is listening once it has bound the
+/// port but before it calls listen(), so a connection made right then can be refused.
+fn accepting(port: u16) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 impl Drop for Diod {
