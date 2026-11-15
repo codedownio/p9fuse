@@ -9,6 +9,7 @@
 //! - `mount`: connecting and running the FUSE session.
 //! - `invalidate`: dropping paths changed outside the mount from the kernel's caches.
 //! - `writes` and `write_pipeline`: open handles, and writes sent in the background.
+//! - `unmount`: ending the session once unmounted from our namespace.
 //! - `attr`: converting 9p attributes to FUSE ones.
 
 mod attr;
@@ -16,6 +17,7 @@ mod filesystem;
 mod invalidate;
 mod mount;
 mod tuning;
+mod unmount;
 mod write_pipeline;
 mod writes;
 
@@ -26,6 +28,7 @@ use crate::ninep::{Attr, Qid};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::Handle;
+use tokio::sync::watch;
 use write_pipeline::{InodeWrites, WriteError};
 
 const ROOT_INO: u64 = 1;
@@ -51,6 +54,8 @@ pub struct Fuse9p {
     root_qid_path: u64,
     /// Open files and directories, by FUSE handle number.
     handles: HashMap<u64, FileHandle>,
+    /// The number of entries in `handles`, for the task that waits for them to close on unmount.
+    open_handles: watch::Sender<usize>,
     next_fh: u64,
     /// The write pipeline of each inode open through a pipelined handle.
     writes: HashMap<u64, Arc<InodeWrites>>,
