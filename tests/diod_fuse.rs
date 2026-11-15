@@ -252,8 +252,9 @@ fn fuse_connection(mp: &Path) -> u32 {
     libc::minor(std::fs::metadata(mp).unwrap().dev())
 }
 
-/// End a FUSE connection whose session outlived its unmount. Sometimes `fusermount3 -u` succeeds
-/// but the kernel keeps the filesystem alive, so the session keeps waiting for requests.
+/// End a FUSE connection whose session outlived its unmount. A process that copies the mount
+/// namespace while the mount is up (a nix build sandbox, a container, `unshare -m`) keeps its own
+/// copy of the mount, and so the filesystem, alive after we unmount ours.
 fn abort_connection(conn: u32) {
     eprintln!("mount still running 5s after unmounting; aborting FUSE connection {conn}");
     let _ = std::fs::write(format!("/sys/fs/fuse/connections/{conn}/abort"), "1");
