@@ -211,18 +211,40 @@ fn umount(mp: &Path) {
 }
 
 /// Unmount `mp` and wait for its mount task to end, failing instead of hanging if it doesn't.
+/// `conn` is the mount's FUSE connection, if it got far enough to have one.
 async fn unmount_and_join(
     mp: &Path,
-    task: tokio::task::JoinHandle<Result<(), String>>,
+    conn: Option<u32>,
+    mut task: tokio::task::JoinHandle<Result<(), String>>,
 ) -> Result<(), String> {
     umount(mp);
-    match tokio::time::timeout(Duration::from_secs(30), task).await {
+    if let Ok(joined) = tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+        return joined.expect("mount task join");
+    }
+    if let Some(conn) = conn {
+        abort_connection(conn);
+    }
+    match tokio::time::timeout(Duration::from_secs(25), task).await {
         Ok(joined) => joined.expect("mount task join"),
         Err(_) => panic!(
             "mount of {} still running 30s after unmounting",
             mp.display()
         ),
     }
+}
+
+/// The number of the FUSE connection behind the mount at `mp`.
+fn fuse_connection(mp: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    libc::minor(std::fs::metadata(mp).unwrap().dev())
+}
+
+/// End a FUSE connection whose session outlived its unmount. This happens when another mount
+/// namespace got a copy of the mount through propagation and was using it when we unmounted: the
+/// kernel leaves that copy mounted, so the session keeps serving it.
+fn abort_connection(conn: u32) {
+    eprintln!("mount still running 5s after unmounting; aborting FUSE connection {conn}");
+    let _ = std::fs::write(format!("/sys/fs/fuse/connections/{conn}/abort"), "1");
 }
 
 /// Which transport to reach diod through. Non-TCP transports use a tiny in-test relay that bridges
@@ -418,12 +440,13 @@ where
             panic!("mount ended before it became ready: {result:?}");
         }
         if Instant::now() >= deadline {
-            let _ = unmount_and_join(&mp, task).await;
+            let _ = unmount_and_join(&mp, None, task).await;
             panic!("mount did not become ready within 15s");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    let conn = fuse_connection(&mp);
     let mp_body = mp.clone();
     let export = diod.export().to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
@@ -435,7 +458,7 @@ where
     })
     .await;
 
-    let mount_result = unmount_and_join(&mp, task).await;
+    let mount_result = unmount_and_join(&mp, Some(conn), task).await;
     for h in relays {
         h.abort();
     }
