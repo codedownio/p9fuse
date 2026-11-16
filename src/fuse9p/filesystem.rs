@@ -245,6 +245,7 @@ impl Filesystem for Fuse9p {
             Some(e) => reply.error(e),
             None => reply.ok(),
         }
+        self.count_handles();
     }
 
     fn create(
@@ -364,6 +365,7 @@ impl Filesystem for Fuse9p {
     ) {
         self.close_handle(fh);
         reply.ok();
+        self.count_handles();
     }
 
     fn mkdir(

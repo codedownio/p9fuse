@@ -44,7 +44,10 @@ use std::path::Path;
 /// - `tuning` controls the caching / write-back knobs (see [`Tuning`]).
 ///
 /// Invalidation requests are read from the process's stdin and answered on its stdout; use
-/// [`mount_with_invalidations`] to use other streams.
+/// [`mount_with_invalidations`] to use other streams. Reading stdin ties up one of the runtime's
+/// blocking threads until stdin closes, so shut the runtime down with
+/// [`shutdown_background`](tokio::runtime::Runtime::shutdown_background) rather than dropping it,
+/// or the process can't exit while stdin stays open.
 pub async fn mount(
     transport: Box<dyn NineTransport>,
     mountpoint: &Path,

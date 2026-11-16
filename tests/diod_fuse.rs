@@ -134,7 +134,7 @@ impl Diod {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn diod");
-            if diod_listening(&mut child) {
+            if diod_listening(&mut child) && accepting(port) {
                 return Diod {
                     child,
                     export,
@@ -173,6 +173,19 @@ fn diod_listening(child: &mut Child) -> bool {
         for _ in lines {}
     });
     rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
+}
+
+/// Wait until a connection to `port` succeeds. diod logs that it is listening once it has bound the
+/// port but before it calls listen(), so a connection made right then can be refused.
+fn accepting(port: u16) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 impl Drop for Diod {
@@ -222,6 +235,52 @@ async fn unmount_and_join(
             "mount of {} still running 30s after unmounting",
             mp.display()
         ),
+    }
+}
+
+/// Run the binary to mount `diod`'s export at `mp`, keeping its stdin open, and wait until the
+/// mount is up.
+fn spawn_binary(diod: &Diod, mp: &Path) -> Child {
+    std::fs::write(diod.export().join(READY), b"1").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_p9fuse"))
+        .arg("mount9p-fuse")
+        .arg(format!("--connect=tcp://127.0.0.1:{}", diod.port))
+        .arg(format!("--uid={}", nix::unistd::geteuid()))
+        .arg("--aname")
+        .arg(diod.export())
+        .arg(mp)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn p9fuse");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !mp.join(READY).exists() {
+        assert!(child.try_wait().unwrap().is_none(), "p9fuse exited early");
+        assert!(Instant::now() < deadline, "mount did not become ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child
+}
+
+/// Wait up to `limit` for `child` to exit.
+fn wait_exit(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+/// A child process killed when dropped.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -1193,4 +1252,94 @@ async fn error_paths() {
         );
     })
     .await;
+}
+
+/// The binary exits once unmounted, even while whoever started it keeps its stdin open.
+#[test]
+fn binary_exits_after_unmount_with_stdin_open() {
+    if let Some(why) = skip_reason() {
+        eprintln!("skipping: {why}");
+        return;
+    }
+    let diod = Diod::start();
+    let mountpoint = tempfile::tempdir().unwrap();
+    let mut child = KillOnDrop(spawn_binary(&diod, mountpoint.path()));
+
+    umount(mountpoint.path());
+    let status = wait_exit(&mut child.0, Duration::from_secs(10));
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "p9fuse exited with {status:?}"
+    );
+}
+
+/// After a lazy unmount the binary keeps serving files that are still open, then exits once they
+/// are closed.
+#[test]
+fn binary_exits_once_files_close_after_lazy_unmount() {
+    if let Some(why) = skip_reason() {
+        eprintln!("skipping: {why}");
+        return;
+    }
+    let diod = Diod::start();
+    let mountpoint = tempfile::tempdir().unwrap();
+    let mp = mountpoint.path();
+    let mut child = KillOnDrop(spawn_binary(&diod, mp));
+    let mut f = std::fs::File::create(mp.join("f")).unwrap();
+    f.write_all(b"before ").unwrap();
+
+    let lazy = Command::new(fusermount_bin().unwrap())
+        .args(["-u", "-z"])
+        .arg(mp)
+        .status()
+        .unwrap();
+    assert!(lazy.success());
+    assert!(wait_exit(&mut child.0, Duration::from_secs(1)).is_none());
+
+    f.write_all(b"after").unwrap();
+    drop(f);
+    let status = wait_exit(&mut child.0, Duration::from_secs(10));
+    assert!(
+        status.is_some_and(|s| s.success()),
+        "p9fuse exited with {status:?}"
+    );
+    assert_eq!(
+        std::fs::read(diod.export().join("f")).unwrap(),
+        b"before after"
+    );
+}
+
+/// The session ends at unmount even while another mount namespace holds a copy of the mount, as a
+/// container or build sandbox started during the mount would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unmount_ends_session_despite_namespace_copy() {
+    if let Some(why) = skip_reason() {
+        eprintln!("skipping: {why}");
+        return;
+    }
+    let unshare = |args: &[&str]| {
+        let mut command = Command::new("unshare");
+        command.args(["-U", "-r", "-m"]).args(args);
+        command
+    };
+    if !unshare(&["true"]).status().is_ok_and(|s| s.success()) {
+        eprintln!("skipping: unshare can't make a user and mount namespace");
+        return;
+    }
+    let holder = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let holder_body = holder.clone();
+    // The holder outlives unmount_and_join's timeout, so the test fails if the session waits for it.
+    with_mount(Tuning::default(), move |mp| {
+        let child = unshare(&["sleep", "120"]).spawn().unwrap();
+        let mountinfo = format!("/proc/{}/mountinfo", child.id());
+        let mp = mp.to_string_lossy().into_owned();
+        *holder_body.lock().unwrap() = Some(KillOnDrop(child));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&mountinfo).is_ok_and(|m| m.contains(&mp)) {
+            assert!(Instant::now() < deadline, "the copy never showed up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+    .await;
+    drop(holder);
 }

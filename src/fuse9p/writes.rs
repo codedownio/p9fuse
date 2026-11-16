@@ -51,11 +51,13 @@ impl Fuse9p {
                 write_error,
             },
         );
+        self.count_handles();
         fh
     }
 
     /// Close handle `fh`: finish its pending writes, release its fid, and drop its inode's write
-    /// pipeline with the last handle that used it. Returns the first unreported write error.
+    /// pipeline with the last handle that used it. Returns the first unreported write error. Call
+    /// `count_handles` once the kernel has its reply.
     pub(super) fn close_handle(&mut self, fh: u64) -> Option<i32> {
         let h = self.handles.remove(&fh)?;
         let err = self.take_write_error(&h);
@@ -65,6 +67,12 @@ impl Fuse9p {
             self.writes.remove(&h.ino);
         }
         err
+    }
+
+    /// Publish how many handles are open. When unmounted, the session ends once this reaches zero,
+    /// so the reply to the last release has to be sent first.
+    pub(super) fn count_handles(&self) {
+        self.open_handles.send_replace(self.handles.len());
     }
 
     /// The most bytes one `Twrite` or `Tread` carries: the msize less the message header.

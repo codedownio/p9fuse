@@ -1,6 +1,6 @@
 [package]
 name = "p9fuse"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Mount a remote 9p2000.L filesystem locally over FUSE, unprivileged."
 license = "MIT"
