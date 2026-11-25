@@ -48,6 +48,16 @@ pub(super) fn negative_attr() -> FileAttr {
     }
 }
 
+/// Attributes for a readdirplus entry the kernel takes nothing from but the inode number and type:
+/// "." and "..".
+pub(super) fn dirent_attr(ino: u64, kind: FileType) -> FileAttr {
+    FileAttr {
+        ino,
+        kind,
+        ..negative_attr()
+    }
+}
+
 /// The file type from a qid's type bits.
 pub(super) fn kind_from_qid(typ: u8) -> FileType {
     if typ & 0x80 != 0 {

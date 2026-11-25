@@ -1,6 +1,6 @@
 //! The FUSE callbacks.
 
-use super::attr::{kind_from_qid, negative_attr, time_or_now, to_fileattr};
+use super::attr::{dirent_attr, kind_from_qid, negative_attr, time_or_now, to_fileattr};
 use super::write_pipeline::{write_all, Write};
 use super::{or_reply, Fuse9p, ROOT_INO};
 use crate::client::NineClient;
@@ -330,21 +330,33 @@ impl Filesystem for Fuse9p {
         let entries = or_reply!(reply, self.rt.block_on(entries));
         // The sizes must include writes we have acknowledged but not sent yet.
         self.settle_writes(None);
-        let walks = entries
-            .iter()
-            .map(|e| walk_attr(&self.client, dir_fid, &e.name));
+        let client = &self.client;
+        let walks = entries.iter().map(|e| async move {
+            if is_dot(&e.name) {
+                None
+            } else {
+                walk_attr(client, dir_fid, &e.name).await
+            }
+        });
         let found = self.rt.block_on(futures_util::future::join_all(walks));
 
         let mut full = false;
+        let ttl = self.tuning.entry_ttl;
         for (e, found) in entries.iter().zip(found) {
+            // `add` is true once the buffer is full; the kernel only takes a lookup reference to
+            // entries that fit. From "." and ".." it takes only the inode number and type, so
+            // they aren't walked.
+            if is_dot(&e.name) {
+                let ino = self.ino(&e.qid);
+                let attr = dirent_attr(ino, kind_from_qid(e.qid.typ));
+                full = full || reply.add(ino, e.offset.cast_signed(), &e.name, &ttl, &attr, 0);
+                continue;
+            }
             let Some((fid, attr)) = found else {
                 continue;
             };
             let ino = self.ino(&attr.qid);
             let attr = to_fileattr(ino, &attr);
-            let ttl = self.tuning.entry_ttl;
-            // `add` is true once the buffer is full; the kernel only takes a lookup reference to
-            // entries that fit.
             full = full || reply.add(ino, e.offset.cast_signed(), &e.name, &ttl, &attr, 0);
             if full {
                 self.clunk(fid);
@@ -479,12 +491,15 @@ impl Fuse9p {
     }
 }
 
-/// Walk a new fid to entry `name` of `dir` ("." is `dir` itself) and get its attributes.
+/// Whether a directory entry is "." or "..".
+fn is_dot(name: &str) -> bool {
+    name == "." || name == ".."
+}
+
+/// Walk a new fid to entry `name` of `dir` and get its attributes.
 async fn walk_attr(client: &NineClient, dir: u32, name: &str) -> Option<(u32, Attr)> {
     let fid = client.alloc_fid();
-    let one = [name];
-    let names: &[&str] = if name == "." { &[] } else { &one };
-    client.walk(dir, fid, names).await.ok()?;
+    client.walk(dir, fid, &[name]).await.ok()?;
     match client.getattr(fid).await {
         Ok(attr) => Some((fid, attr)),
         Err(_) => {

@@ -662,6 +662,37 @@ async fn rename_over_existing() {
     .await;
 }
 
+/// With READDIRPLUS, listing a directory returns its ".." entry, which must not become the parent's
+/// fid: diod resolves fids by path, so "child/.." stops working once the child is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readdirplus_dotdot_leaves_parent_usable() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP readdirplus_dotdot_leaves_parent_usable: {reason}");
+        return;
+    }
+    let tuning = Tuning {
+        readdirplus: true,
+        ..Tuning::default()
+    };
+    with_mount(tuning, move |mp| {
+        std::fs::create_dir_all(mp.join("parent/child")).unwrap();
+        std::fs::write(mp.join("parent/child/f"), b"x").unwrap();
+        // `ls -F` marks directories from the entry type alone, without stat.
+        let ls = Command::new("ls")
+            .args(["-aF", "--", mp.join("parent/child").to_str().unwrap()])
+            .output()
+            .unwrap();
+        let ls = String::from_utf8(ls.stdout).unwrap();
+        assert_eq!(ls.lines().collect::<Vec<_>>(), ["./", "../", "f"]);
+
+        std::fs::remove_file(mp.join("parent/child/f")).unwrap();
+        std::fs::remove_dir(mp.join("parent/child")).unwrap();
+        std::fs::write(mp.join("parent/g"), b"y").unwrap();
+        assert_eq!(std::fs::read(mp.join("parent/g")).unwrap(), b"y");
+    })
+    .await;
+}
+
 /// Protocol-level (no FUSE): isolate whether a rename followed by a walk to the new name works at
 /// the raw 9p layer, below the FUSE inode/fid bookkeeping.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
