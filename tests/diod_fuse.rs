@@ -112,7 +112,9 @@ struct Diod {
 impl Diod {
     /// Start diod on a free port. The port is only free when we look: another test may take it
     /// before diod binds it, so wait for diod itself to say it is listening, and try another port
-    /// if it couldn't bind.
+    /// if it couldn't bind. Two diods can even both bind the port, as diod sets SO_REUSEADDR and
+    /// says "Listening on" before it calls listen(), which then fails for the second; so also check
+    /// that the listening socket is this diod's before using the port.
     fn start() -> Diod {
         let diod = find_diod().expect("diod (checked by skip_reason)");
         let export = tempfile::tempdir().unwrap();
@@ -134,7 +136,7 @@ impl Diod {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn diod");
-            if diod_listening(&mut child) && accepting(port) {
+            if diod_listening(&mut child) && owns_listener(&mut child, port) {
                 return Diod {
                     child,
                     export,
@@ -153,7 +155,7 @@ impl Diod {
 }
 
 /// Read diod's log until it says it is listening (true) or exits without doing so (false). The rest
-/// of the log is drained in the background so diod never blocks writing it.
+/// of the log goes to stderr, with a prefix, so a failure shows diod's side of it.
 fn diod_listening(child: &mut Child) -> bool {
     let stderr = child.stderr.take().expect("diod stderr piped");
     let (tx, rx) = std::sync::mpsc::channel();
@@ -165,27 +167,62 @@ fn diod_listening(child: &mut Child) -> bool {
                     let _ = tx.send(true);
                     break;
                 }
-                Ok(_) => {}
+                Ok(l) => eprintln!("diod: {l}"),
                 Err(_) => break,
             }
         }
         let _ = tx.send(false);
-        for _ in lines {}
+        for l in lines.map_while(Result::ok) {
+            eprintln!("diod: {l}");
+        }
     });
     rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
 }
 
-/// Wait until a connection to `port` succeeds. diod logs that it is listening once it has bound the
-/// port but before it calls listen(), so a connection made right then can be refused.
-fn accepting(port: u16) -> bool {
+/// Wait until `child` has a socket listening on `port`: false if it exits first, or doesn't within
+/// a few seconds. diod says it is listening once it has bound the port but before it calls
+/// listen(), and another process bound to the port in between makes that listen() fail quietly.
+fn owns_listener(child: &mut Child, port: u16) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if child.try_wait().unwrap().is_some() {
+            return false;
+        }
+        if listener_inode(port).is_some_and(|inode| socket_inodes(child.id()).contains(&inode)) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     false
+}
+
+/// The inode of the TCP socket listening on `port` of 127.0.0.1, from /proc/net/tcp.
+fn listener_inode(port: u16) -> Option<u64> {
+    let local = format!("0100007F:{port:04X}");
+    std::fs::read_to_string("/proc/net/tcp")
+        .ok()?
+        .lines()
+        .skip(1)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|f| f.len() > 9 && f[1] == local && f[3] == "0A")
+        .and_then(|f| f[9].parse().ok())
+}
+
+/// The inodes of the sockets process `pid` has open.
+fn socket_inodes(pid: u32) -> Vec<u64> {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    fds.filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+        .filter_map(|target| {
+            let target = target.to_str()?;
+            target
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')?
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 impl Drop for Diod {
