@@ -92,7 +92,7 @@ fn qid_to_ino(qid_path: u64, root_qid_path: u64) -> u64 {
     }
 }
 
-fn is_dir(qid: &Qid) -> bool {
+pub(super) fn is_dir(qid: &Qid) -> bool {
     qid.typ & 0x80 != 0
 }
 
@@ -221,6 +221,29 @@ impl Fuse9p {
             None => fid,
         };
         self.clunk(stale);
+    }
+
+    /// Walk the fids of the inodes held under directory `dir` again, from their parents' fids: the
+    /// directory moved, so the paths diod tied them to name nothing now.
+    fn rewalk_descendants(&mut self, dir: u64) {
+        let mut dirs = vec![dir];
+        while let Some(dir) = dirs.pop() {
+            let Ok(dir_fid) = self.fid_of(dir) else {
+                continue;
+            };
+            let children: Vec<(u64, Box<str>)> = self
+                .inodes
+                .iter()
+                .filter(|(&ino, inode)| inode.parent == dir && ino != ROOT_INO)
+                .map(|(&ino, inode)| (ino, inode.name.clone()))
+                .collect();
+            for (child, name) in children {
+                if let Ok((fresh, _)) = self.walk(dir_fid, &[&name]) {
+                    self.replace_fid(child, fresh, dir, &name);
+                }
+                dirs.push(child);
+            }
+        }
     }
 
     /// Drop `n` of the kernel's lookup references to `ino`, releasing its fid once none are left.

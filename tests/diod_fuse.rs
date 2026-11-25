@@ -869,6 +869,28 @@ async fn cwd_survives_external_directory_rename() {
     .await;
 }
 
+/// Renaming a directory through the mount leaves the kernel's entries under it valid, so nothing
+/// is looked up again, yet diod tied their fids to paths under the old name. Reading a file two
+/// levels down must still work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_usable_after_directory_rename() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP files_usable_after_directory_rename: {reason}");
+        return;
+    }
+    with_mount(Tuning::default(), |mp| {
+        std::fs::create_dir_all(mp.join("a/sub")).unwrap();
+        std::fs::write(mp.join("a/sub/child"), b"c").unwrap();
+        assert_eq!(std::fs::read(mp.join("a/sub/child")).unwrap(), b"c");
+
+        std::fs::rename(mp.join("a"), mp.join("b")).unwrap();
+        assert_eq!(std::fs::read(mp.join("b/sub/child")).unwrap(), b"c");
+        std::fs::write(mp.join("b/sub/child"), b"d").unwrap();
+        assert_eq!(std::fs::read(mp.join("b/sub/child")).unwrap(), b"d");
+    })
+    .await;
+}
+
 /// With READDIRPLUS, listing a directory returns its ".." entry, which must not become the parent's
 /// fid: diod resolves fids by path, so "child/.." stops working once the child is removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2,7 +2,7 @@
 
 use super::attr::{dirent_attr, kind_from_qid, negative_attr, time_or_now, to_fileattr};
 use super::write_pipeline::{write_all, Write};
-use super::{or_reply, Fuse9p, ROOT_INO};
+use super::{is_dir, or_reply, Fuse9p, ROOT_INO};
 use crate::client::NineClient;
 use crate::ninep::{
     Attr, SETATTR_ATIME, SETATTR_ATIME_SET, SETATTR_GID, SETATTR_MODE, SETATTR_MTIME,
@@ -447,10 +447,17 @@ impl Filesystem for Fuse9p {
         or_reply!(reply, self.rt.block_on(renamed));
 
         // diod ties a fid to a path, so the moved file's fid now fails with ENOENT, and the kernel
-        // goes on using the inode without looking it up again. Give it a fid at the new path.
+        // goes on using the inode without looking it up again. Give it a fid at the new path, and
+        // the files under a moved directory too.
         if let Ok((fresh, qids)) = self.walk(to, &[&newname]) {
-            match qids.last().map(|qid| self.ino(qid)) {
-                Some(ino) => self.replace_fid(ino, fresh, newparent, &newname),
+            match qids.last() {
+                Some(qid) => {
+                    let ino = self.ino(qid);
+                    self.replace_fid(ino, fresh, newparent, &newname);
+                    if is_dir(qid) {
+                        self.rewalk_descendants(ino);
+                    }
+                }
                 None => self.clunk(fresh),
             }
         }
