@@ -136,16 +136,35 @@ impl Fuse9p {
         }
     }
 
-    /// Count a lookup reference the kernel now holds to `ino`, which we reached through `fid`. A new
-    /// inode keeps `fid`; a known one already has a fid, so `fid` is released.
+    /// Count a lookup reference the kernel now holds to `ino`, which we reached through `fid`. A
+    /// known inode switches to `fid`: diod ties a fid to a path, and the one it had may name a
+    /// different file by now, since an inode number freed on the server can be given to a new file
+    /// before the kernel forgets the old one. (For a hard-linked file this means the fid follows the
+    /// name looked up last, and removing that name breaks the others until the entry TTL passes.)
+    /// The root keeps its attach fid, which the invalidator walks from.
     fn add_lookup(&mut self, ino: u64, fid: u32) {
         match self.inodes.get_mut(&ino) {
-            Some(inode) => inode.lookups += 1,
+            Some(inode) => {
+                inode.lookups += 1;
+                if ino == ROOT_INO {
+                    self.clunk(fid);
+                } else {
+                    self.replace_fid(ino, fid);
+                }
+            }
             None => {
                 self.inodes.insert(ino, Inode { fid, lookups: 1 });
-                return;
             }
         }
-        self.clunk(fid);
+    }
+
+    /// Make `fid` the fid of `ino` and release the one it had. `fid` is released instead if the
+    /// kernel doesn't hold `ino`.
+    fn replace_fid(&mut self, ino: u64, fid: u32) {
+        let stale = match self.inodes.get_mut(&ino) {
+            Some(inode) => std::mem::replace(&mut inode.fid, fid),
+            None => fid,
+        };
+        self.clunk(stale);
     }
 }

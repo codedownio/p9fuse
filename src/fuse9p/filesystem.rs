@@ -447,12 +447,8 @@ impl Filesystem for Fuse9p {
         // diod ties a fid to a path, so the moved file's fid now fails with ENOENT, and the kernel
         // goes on using the inode without looking it up again. Give it a fid at the new path.
         if let Ok((fresh, qids)) = self.walk(to, &[&newname]) {
-            let ino = qids.last().map(|qid| self.ino(qid));
-            match ino.and_then(|ino| self.inodes.get_mut(&ino)) {
-                Some(inode) => {
-                    let stale = std::mem::replace(&mut inode.fid, fresh);
-                    self.clunk(stale);
-                }
+            match qids.last().map(|qid| self.ino(qid)) {
+                Some(ino) => self.replace_fid(ino, fresh),
                 None => self.clunk(fresh),
             }
         }

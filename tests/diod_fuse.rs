@@ -19,7 +19,7 @@ use p9fuse::{
     WebSocketTransport,
 };
 use std::io::{BufRead, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -658,6 +658,59 @@ async fn rename_over_existing() {
         std::fs::rename(mp.join("src"), mp.join("dst")).unwrap();
         assert!(!mp.join("src").exists());
         assert_eq!(std::fs::read(mp.join("dst")).unwrap(), b"SRC");
+    })
+    .await;
+}
+
+/// Make the kernel hold a file by looking it up through the mount, overwrite it from outside the
+/// mount with a file saying "new", and make a new entry through the mount with `make`, so that the
+/// entry gets the old file's inode number: only a lookup was done, so nothing holds the old file
+/// open, and the server's filesystem (ext4, not tmpfs) hands its number to the next file made.
+/// Another test's files can take the number first, so this is tried a few times. Returns the names
+/// of the overwritten file and the new entry, or `None` (saying so) if the number was never reused,
+/// in which case a test can't go on.
+fn reuse_inode(m: &Mounted<'_>, test: &str, make: impl Fn(&Path)) -> Option<(String, String)> {
+    for attempt in 0..5 {
+        let (old, new) = (format!("old{attempt}"), format!("new{attempt}"));
+        std::fs::write(m.export.join(&old), b"old").unwrap();
+        let old_ino = std::fs::metadata(m.export.join(&old)).unwrap().ino();
+        std::fs::metadata(m.mp.join(&old)).unwrap();
+
+        let tmp = format!(".{old}");
+        std::fs::write(m.export.join(&tmp), b"new").unwrap();
+        std::fs::rename(m.export.join(&tmp), m.export.join(&old)).unwrap();
+        make(&m.mp.join(&new));
+        if std::fs::metadata(m.export.join(&new)).unwrap().ino() == old_ino {
+            return Some((old, new));
+        }
+    }
+    eprintln!("SKIP {test}: the export's filesystem didn't reuse the inode number");
+    None
+}
+
+/// A file overwritten from outside the mount frees its inode number, which the server's filesystem
+/// can give straight to a directory made through the mount while the kernel still holds the old
+/// file. The new directory must be usable, not reached through the old file's fid (ENOTDIR).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_directory_reusing_overwritten_inode() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP new_directory_reusing_overwritten_inode: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |m| {
+        let test = "new_directory_reusing_overwritten_inode";
+        let mkdir = |dir: &Path| std::fs::create_dir(dir).unwrap();
+        let Some((doc, dir)) = reuse_inode(&m, test, mkdir) else {
+            return;
+        };
+
+        std::fs::create_dir(m.mp.join(&dir).join("sub")).unwrap();
+        std::fs::write(m.mp.join(&dir).join("sub/f"), b"x").unwrap();
+        assert_eq!(
+            std::fs::read(m.export.join(&dir).join("sub/f")).unwrap(),
+            b"x"
+        );
+        assert_eq!(std::fs::read(m.mp.join(&doc)).unwrap(), b"new");
     })
     .await;
 }
