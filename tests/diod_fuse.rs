@@ -19,7 +19,7 @@ use p9fuse::{
     WebSocketTransport,
 };
 use std::io::{BufRead, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -112,7 +112,9 @@ struct Diod {
 impl Diod {
     /// Start diod on a free port. The port is only free when we look: another test may take it
     /// before diod binds it, so wait for diod itself to say it is listening, and try another port
-    /// if it couldn't bind.
+    /// if it couldn't bind. Two diods can even both bind the port, as diod sets SO_REUSEADDR and
+    /// says "Listening on" before it calls listen(), which then fails for the second; so also check
+    /// that the listening socket is this diod's before using the port.
     fn start() -> Diod {
         let diod = find_diod().expect("diod (checked by skip_reason)");
         let export = tempfile::tempdir().unwrap();
@@ -134,7 +136,7 @@ impl Diod {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn diod");
-            if diod_listening(&mut child) && accepting(port) {
+            if diod_listening(&mut child) && owns_listener(&mut child, port) {
                 return Diod {
                     child,
                     export,
@@ -153,7 +155,7 @@ impl Diod {
 }
 
 /// Read diod's log until it says it is listening (true) or exits without doing so (false). The rest
-/// of the log is drained in the background so diod never blocks writing it.
+/// of the log goes to stderr, with a prefix, so a failure shows diod's side of it.
 fn diod_listening(child: &mut Child) -> bool {
     let stderr = child.stderr.take().expect("diod stderr piped");
     let (tx, rx) = std::sync::mpsc::channel();
@@ -165,27 +167,62 @@ fn diod_listening(child: &mut Child) -> bool {
                     let _ = tx.send(true);
                     break;
                 }
-                Ok(_) => {}
+                Ok(l) => eprintln!("diod: {l}"),
                 Err(_) => break,
             }
         }
         let _ = tx.send(false);
-        for _ in lines {}
+        for l in lines.map_while(Result::ok) {
+            eprintln!("diod: {l}");
+        }
     });
     rx.recv_timeout(Duration::from_secs(10)).unwrap_or(false)
 }
 
-/// Wait until a connection to `port` succeeds. diod logs that it is listening once it has bound the
-/// port but before it calls listen(), so a connection made right then can be refused.
-fn accepting(port: u16) -> bool {
+/// Wait until `child` has a socket listening on `port`: false if it exits first, or doesn't within
+/// a few seconds. diod says it is listening once it has bound the port but before it calls
+/// listen(), and another process bound to the port in between makes that listen() fail quietly.
+fn owns_listener(child: &mut Child, port: u16) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if child.try_wait().unwrap().is_some() {
+            return false;
+        }
+        if listener_inode(port).is_some_and(|inode| socket_inodes(child.id()).contains(&inode)) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     false
+}
+
+/// The inode of the TCP socket listening on `port` of 127.0.0.1, from /proc/net/tcp.
+fn listener_inode(port: u16) -> Option<u64> {
+    let local = format!("0100007F:{port:04X}");
+    std::fs::read_to_string("/proc/net/tcp")
+        .ok()?
+        .lines()
+        .skip(1)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|f| f.len() > 9 && f[1] == local && f[3] == "0A")
+        .and_then(|f| f[9].parse().ok())
+}
+
+/// The inodes of the sockets process `pid` has open.
+fn socket_inodes(pid: u32) -> Vec<u64> {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    fds.filter_map(|fd| std::fs::read_link(fd.ok()?.path()).ok())
+        .filter_map(|target| {
+            let target = target.to_str()?;
+            target
+                .strip_prefix("socket:[")?
+                .strip_suffix(']')?
+                .parse()
+                .ok()
+        })
+        .collect()
 }
 
 impl Drop for Diod {
@@ -658,6 +695,229 @@ async fn rename_over_existing() {
         std::fs::rename(mp.join("src"), mp.join("dst")).unwrap();
         assert!(!mp.join("src").exists());
         assert_eq!(std::fs::read(mp.join("dst")).unwrap(), b"SRC");
+    })
+    .await;
+}
+
+/// Make the kernel hold a file by looking it up through the mount, overwrite it from outside the
+/// mount with a file saying "new", and make a new entry through the mount with `make`, so that the
+/// entry gets the old file's inode number: only a lookup was done, so nothing holds the old file
+/// open, and the server's filesystem (ext4, not tmpfs) hands its number to the next file made.
+/// Another test's files can take the number first, so this is tried a few times. Returns the names
+/// of the overwritten file and the new entry, or `None` (saying so) if the number was never reused,
+/// in which case a test can't go on.
+fn reuse_inode(m: &Mounted<'_>, test: &str, make: impl Fn(&Path)) -> Option<(String, String)> {
+    for attempt in 0..5 {
+        let (old, new) = (format!("old{attempt}"), format!("new{attempt}"));
+        std::fs::write(m.export.join(&old), b"old").unwrap();
+        let old_ino = std::fs::metadata(m.export.join(&old)).unwrap().ino();
+        std::fs::metadata(m.mp.join(&old)).unwrap();
+
+        let tmp = format!(".{old}");
+        std::fs::write(m.export.join(&tmp), b"new").unwrap();
+        std::fs::rename(m.export.join(&tmp), m.export.join(&old)).unwrap();
+        make(&m.mp.join(&new));
+        if std::fs::metadata(m.export.join(&new)).unwrap().ino() == old_ino {
+            return Some((old, new));
+        }
+    }
+    eprintln!("SKIP {test}: the export's filesystem didn't reuse the inode number");
+    None
+}
+
+/// A file overwritten from outside the mount frees its inode number, which the server's filesystem
+/// can give straight to a directory made through the mount while the kernel still holds the old
+/// file. The new directory must be usable, not reached through the old file's fid (ENOTDIR).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_directory_reusing_overwritten_inode() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP new_directory_reusing_overwritten_inode: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |m| {
+        let test = "new_directory_reusing_overwritten_inode";
+        let mkdir = |dir: &Path| std::fs::create_dir(dir).unwrap();
+        let Some((doc, dir)) = reuse_inode(&m, test, mkdir) else {
+            return;
+        };
+
+        std::fs::create_dir(m.mp.join(&dir).join("sub")).unwrap();
+        std::fs::write(m.mp.join(&dir).join("sub/f"), b"x").unwrap();
+        assert_eq!(
+            std::fs::read(m.export.join(&dir).join("sub/f")).unwrap(),
+            b"x"
+        );
+        assert_eq!(std::fs::read(m.mp.join(&doc)).unwrap(), b"new");
+    })
+    .await;
+}
+
+/// The freed inode number can also go to a file of the same type as the one the kernel holds. The
+/// kernel then only tells them apart by generation; without one it would serve the new file under
+/// the old name until the entry expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_file_reusing_overwritten_inode() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP new_file_reusing_overwritten_inode: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |m| {
+        let test = "new_file_reusing_overwritten_inode";
+        let create = |file: &Path| std::fs::write(file, b"other").unwrap();
+        let Some((doc, other)) = reuse_inode(&m, test, create) else {
+            return;
+        };
+
+        assert_eq!(std::fs::read(m.mp.join(&doc)).unwrap(), b"new");
+        assert_eq!(std::fs::read(m.mp.join(&other)).unwrap(), b"other");
+    })
+    .await;
+}
+
+/// A file moved from outside the mount while open through it is still the same file, so looking
+/// it up by its new name must not make the kernel drop the inode and fail the open descriptor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moved_open_file_keeps_its_inode() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP moved_open_file_keeps_its_inode: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |m| {
+        std::fs::write(m.mp.join("a"), b"content").unwrap();
+        let mut open = std::fs::File::open(m.mp.join("a")).unwrap();
+        let ino = open.metadata().unwrap().ino();
+
+        std::fs::rename(m.export.join("a"), m.export.join("b")).unwrap();
+        assert_eq!(std::fs::read(m.mp.join("b")).unwrap(), b"content");
+        assert_eq!(std::fs::metadata(m.mp.join("b")).unwrap().ino(), ino);
+
+        let mut read = Vec::new();
+        std::io::Read::read_to_end(&mut open, &mut read).unwrap();
+        assert_eq!(read, b"content");
+    })
+    .await;
+}
+
+/// A directory renamed from outside the mount leaves the fids of the files under it naming the old
+/// path, as diod ties a fid to its whole path. Looking a file up again by its own name in the moved
+/// directory must give it a working fid. (Entry TTL 0, so that every access looks up again.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_usable_after_external_directory_rename() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP child_usable_after_external_directory_rename: {reason}");
+        return;
+    }
+    let tuning = Tuning {
+        entry_ttl: Duration::ZERO,
+        ..Tuning::default()
+    };
+    with_mount_full(Via::Tcp, tuning, |m| {
+        std::fs::create_dir(m.mp.join("a")).unwrap();
+        std::fs::write(m.mp.join("a/child"), b"c").unwrap();
+        assert_eq!(std::fs::read(m.mp.join("a/child")).unwrap(), b"c");
+
+        std::fs::rename(m.export.join("a"), m.export.join("b")).unwrap();
+        assert_eq!(std::fs::read(m.mp.join("b/child")).unwrap(), b"c");
+    })
+    .await;
+}
+
+/// A process's working directory is held by the kernel without a FUSE handle. When that directory
+/// is renamed from outside the mount and then looked up by its new name, it must stay the same inode
+/// for the kernel, or the process gets EIO for everything it does there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cwd_survives_external_directory_rename() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP cwd_survives_external_directory_rename: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |m| {
+        std::fs::create_dir(m.mp.join("d")).unwrap();
+        // The shell reports its cwd's inode once inside, and lists it when told to go on.
+        let script = format!(
+            "cd {} && stat -c %i . && read go && ls && echo listed",
+            m.mp.join("d").display()
+        );
+        let mut sh = Command::new("sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(sh.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(
+            line.trim(),
+            std::fs::metadata(m.export.join("d"))
+                .unwrap()
+                .ino()
+                .to_string()
+        );
+
+        std::fs::rename(m.export.join("d"), m.export.join("e")).unwrap();
+        std::fs::metadata(m.mp.join("e")).unwrap();
+        sh.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut rest).unwrap();
+        assert!(
+            sh.wait().unwrap().success(),
+            "shell failed in its renamed cwd"
+        );
+        assert_eq!(rest.trim(), "listed");
+    })
+    .await;
+}
+
+/// Renaming a directory through the mount leaves the kernel's entries under it valid, so nothing
+/// is looked up again, yet diod tied their fids to paths under the old name. Reading a file two
+/// levels down must still work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn files_usable_after_directory_rename() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP files_usable_after_directory_rename: {reason}");
+        return;
+    }
+    with_mount(Tuning::default(), |mp| {
+        std::fs::create_dir_all(mp.join("a/sub")).unwrap();
+        std::fs::write(mp.join("a/sub/child"), b"c").unwrap();
+        assert_eq!(std::fs::read(mp.join("a/sub/child")).unwrap(), b"c");
+
+        std::fs::rename(mp.join("a"), mp.join("b")).unwrap();
+        assert_eq!(std::fs::read(mp.join("b/sub/child")).unwrap(), b"c");
+        std::fs::write(mp.join("b/sub/child"), b"d").unwrap();
+        assert_eq!(std::fs::read(mp.join("b/sub/child")).unwrap(), b"d");
+    })
+    .await;
+}
+
+/// With READDIRPLUS, listing a directory returns its ".." entry, which must not become the parent's
+/// fid: diod resolves fids by path, so "child/.." stops working once the child is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readdirplus_dotdot_leaves_parent_usable() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP readdirplus_dotdot_leaves_parent_usable: {reason}");
+        return;
+    }
+    let tuning = Tuning {
+        readdirplus: true,
+        ..Tuning::default()
+    };
+    with_mount(tuning, move |mp| {
+        std::fs::create_dir_all(mp.join("parent/child")).unwrap();
+        std::fs::write(mp.join("parent/child/f"), b"x").unwrap();
+        // `ls -F` marks directories from the entry type alone, without stat.
+        let ls = Command::new("ls")
+            .args(["-aF", "--", mp.join("parent/child").to_str().unwrap()])
+            .output()
+            .unwrap();
+        let ls = String::from_utf8(ls.stdout).unwrap();
+        assert_eq!(ls.lines().collect::<Vec<_>>(), ["./", "../", "f"]);
+
+        std::fs::remove_file(mp.join("parent/child/f")).unwrap();
+        std::fs::remove_dir(mp.join("parent/child")).unwrap();
+        std::fs::write(mp.join("parent/g"), b"y").unwrap();
+        assert_eq!(std::fs::read(mp.join("parent/g")).unwrap(), b"y");
     })
     .await;
 }

@@ -25,7 +25,7 @@ pub use tuning::Tuning;
 
 use crate::client::NineClient;
 use crate::ninep::{Attr, Qid};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -50,6 +50,9 @@ pub struct Fuse9p {
     tuning: Tuning,
     /// Inodes the kernel holds lookup references to.
     inodes: HashMap<u64, Inode>,
+    /// The inodes in `inodes` whose `parent` is each directory, so that a renamed directory's
+    /// descendants are found in time proportional to their number.
+    children: HashMap<u64, HashSet<u64>>,
     /// The export root's qid path, which is FUSE inode 1 rather than itself. See `qid_to_ino`.
     root_qid_path: u64,
     /// Open files and directories, by FUSE handle number.
@@ -65,6 +68,13 @@ struct Inode {
     /// A fid walked to the file but not opened, used for getattr/setattr and to walk or open from.
     fid: u32,
     lookups: u64,
+    /// Where `fid` was walked to: the directory inode and the name in it. diod ties a fid to its
+    /// path, so this is what `fid` really names.
+    parent: u64,
+    name: Box<str>,
+    /// Told to the kernel with the inode number; changes when the number is found to have passed to
+    /// another file, so the kernel drops the inode it holds instead of merging the two files.
+    generation: u64,
 }
 
 struct FileHandle {
@@ -83,6 +93,10 @@ fn qid_to_ino(qid_path: u64, root_qid_path: u64) -> u64 {
     } else {
         qid_path
     }
+}
+
+pub(super) fn is_dir(qid: &Qid) -> bool {
+    qid.typ & 0x80 != 0
 }
 
 impl Fuse9p {
@@ -136,16 +150,159 @@ impl Fuse9p {
         }
     }
 
-    /// Count a lookup reference the kernel now holds to `ino`, which we reached through `fid`. A new
-    /// inode keeps `fid`; a known one already has a fid, so `fid` is released.
-    fn add_lookup(&mut self, ino: u64, fid: u32) {
-        match self.inodes.get_mut(&ino) {
-            Some(inode) => inode.lookups += 1,
-            None => {
-                self.inodes.insert(ino, Inode { fid, lookups: 1 });
-                return;
+    /// Count a lookup reference the kernel now holds to `ino`, reached through `fid` as `name` in
+    /// directory `parent`, and return the generation to report with it.
+    ///
+    /// A known inode takes `fid` when it was found by the path its own fid was walked by: diod ties
+    /// a fid to the whole path, so a rename above the file has left that one naming nothing, and the
+    /// new fid is as good otherwise. Found by another path, the inode keeps its fid while that still
+    /// names the same file, as with a hard link (asking the server); if not, the file was moved or
+    /// deleted outside the mount and `fid` takes over. A deleted file's number may already be this
+    /// new file's, which the kernel can't tell from the file it holds unless the generation
+    /// changes. They can only be the same file if we have it open, since the server's open
+    /// descriptor then keeps the number from being reused; a file moved outside the mount while
+    /// not open gets a new generation too, which only costs the kernel its caches for it. A
+    /// directory keeps its generation: the kernel caches no data for one, so merging two is only a
+    /// stale listing until the entry expires, while a new generation fails every process whose
+    /// working directory is inside with EIO, and a directory renamed outside the mount is the
+    /// likelier case.
+    ///
+    /// Not told apart: a file replaced at the same path by one of the same type with the same number
+    /// (diod reports no generation of its own; the kernel sees the attributes change), and a
+    /// hard-linked file's fid still breaks when the name it was walked by is removed.
+    fn add_lookup(&mut self, parent: u64, name: &str, qid: &Qid, fid: u32) -> u64 {
+        let ino = self.ino(qid);
+        let Some(inode) = self.inodes.get_mut(&ino) else {
+            let inode = Inode {
+                fid,
+                lookups: 1,
+                parent,
+                name: name.into(),
+                generation: 0,
+            };
+            self.inodes.insert(ino, inode);
+            self.children.entry(parent).or_default().insert(ino);
+            return 0;
+        };
+        inode.lookups += 1;
+        let (old_fid, mut generation) = (inode.fid, inode.generation);
+        let same_path = inode.parent == parent && *inode.name == *name;
+        // The root keeps its attach fid, which the invalidator walks from.
+        if ino == ROOT_INO {
+            self.clunk(fid);
+            return generation;
+        }
+        if !same_path {
+            if self.names(old_fid, ino) {
+                self.clunk(fid);
+                return generation;
+            }
+            if !is_dir(qid) && !self.handles.values().any(|h| h.ino == ino) {
+                generation += 1;
+                self.inodes.get_mut(&ino).expect("checked above").generation = generation;
             }
         }
-        self.clunk(fid);
+        self.replace_fid(ino, fid, parent, name);
+        generation
+    }
+
+    /// Whether `fid` still names the file with inode number `ino`.
+    fn names(&self, fid: u32, ino: u64) -> bool {
+        self.rt
+            .block_on(self.client.getattr(fid))
+            .is_ok_and(|attr| self.ino(&attr.qid) == ino)
+    }
+
+    /// Make `fid`, walked to `name` in directory `parent`, the fid of `ino` and release the one it
+    /// had. `fid` is released instead if the kernel doesn't hold `ino`.
+    fn replace_fid(&mut self, ino: u64, fid: u32, parent: u64, name: &str) {
+        let stale = match self.inodes.get_mut(&ino) {
+            Some(inode) => {
+                let old_parent = std::mem::replace(&mut inode.parent, parent);
+                inode.name = name.into();
+                let stale = std::mem::replace(&mut inode.fid, fid);
+                if old_parent != parent {
+                    self.unlink_child(old_parent, ino);
+                    self.children.entry(parent).or_default().insert(ino);
+                }
+                stale
+            }
+            None => fid,
+        };
+        self.clunk(stale);
+    }
+
+    /// Take `ino` out of `parent`'s children.
+    fn unlink_child(&mut self, parent: u64, ino: u64) {
+        if let Some(set) = self.children.get_mut(&parent) {
+            set.remove(&ino);
+            if set.is_empty() {
+                self.children.remove(&parent);
+            }
+        }
+    }
+
+    /// Walk the fids of the inodes held under directory `dir` again, from their parents' fids: the
+    /// directory moved, so the paths diod tied them to name nothing now. Each level of the tree is
+    /// walked in batches of concurrent requests, so the FUSE thread blocks for a few round trips
+    /// per level rather than one per file. (The batch keeps well clear of the 16-bit tag space,
+    /// and of many thousands of requests in flight at once, which the server answers
+    /// disproportionately slowly.)
+    fn rewalk_descendants(&mut self, dir: u64) {
+        const BATCH: usize = 512;
+        let Ok(dir_fid) = self.fid_of(dir) else {
+            return;
+        };
+        let mut level = vec![(dir, dir_fid)];
+        while !level.is_empty() {
+            let mut todo = Vec::new();
+            for (parent, parent_fid) in level {
+                for &ino in self.children.get(&parent).into_iter().flatten() {
+                    if let Some(inode) = self.inodes.get(&ino) {
+                        todo.push((parent_fid, ino, inode.name.clone()));
+                    }
+                }
+            }
+            level = Vec::new();
+            for batch in todo.chunks(BATCH) {
+                let client = &self.client;
+                let walks = batch.iter().map(|(parent_fid, _, name)| async move {
+                    let fid = client.alloc_fid();
+                    let qids = client.walk(*parent_fid, fid, &[name]).await.ok()?;
+                    Some((fid, qids))
+                });
+                let walked = self.rt.block_on(futures_util::future::join_all(walks));
+
+                let mut stale = Vec::new();
+                for ((_, ino, _), walked) in batch.iter().zip(walked) {
+                    let Some((fid, qids)) = walked else {
+                        continue;
+                    };
+                    let Some(inode) = self.inodes.get_mut(ino) else {
+                        stale.push(fid);
+                        continue;
+                    };
+                    stale.push(std::mem::replace(&mut inode.fid, fid));
+                    if qids.last().is_some_and(is_dir) {
+                        level.push((*ino, fid));
+                    }
+                }
+                let clunks = stale.into_iter().map(|fid| self.client.clunk(fid));
+                let _ = self.rt.block_on(futures_util::future::join_all(clunks));
+            }
+        }
+    }
+
+    /// Drop `n` of the kernel's lookup references to `ino`, releasing its fid once none are left.
+    fn forget_lookups(&mut self, ino: u64, n: u64) {
+        if let Some(inode) = self.inodes.get_mut(&ino) {
+            inode.lookups = inode.lookups.saturating_sub(n);
+            if inode.lookups == 0 {
+                let (fid, parent) = (inode.fid, inode.parent);
+                self.inodes.remove(&ino);
+                self.unlink_child(parent, ino);
+                self.clunk(fid);
+            }
+        }
     }
 }

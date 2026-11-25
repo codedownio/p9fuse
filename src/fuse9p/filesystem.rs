@@ -1,8 +1,8 @@
 //! The FUSE callbacks.
 
-use super::attr::{kind_from_qid, negative_attr, time_or_now, to_fileattr};
+use super::attr::{dirent_attr, kind_from_qid, negative_attr, time_or_now, to_fileattr};
 use super::write_pipeline::{write_all, Write};
-use super::{or_reply, Fuse9p, ROOT_INO};
+use super::{is_dir, or_reply, Fuse9p, ROOT_INO};
 use crate::client::NineClient;
 use crate::ninep::{
     Attr, SETATTR_ATIME, SETATTR_ATIME_SET, SETATTR_GID, SETATTR_MODE, SETATTR_MTIME,
@@ -52,8 +52,8 @@ impl Filesystem for Fuse9p {
         });
         match (found, self.tuning.negative_ttl) {
             (Ok((fid, attr)), _) => {
-                let attr = self.add_entry(fid, &attr);
-                reply.entry(&self.tuning.entry_ttl, &attr, 0);
+                let (attr, generation) = self.add_entry(parent, &name, fid, &attr);
+                reply.entry(&self.tuning.entry_ttl, &attr, generation);
             }
             (Err(libc::ENOENT), Some(ttl)) => reply.entry(&ttl, &negative_attr(), 0),
             (Err(e), _) => reply.error(e),
@@ -61,16 +61,8 @@ impl Filesystem for Fuse9p {
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        if ino == ROOT_INO {
-            return;
-        }
-        if let Some(inode) = self.inodes.get_mut(&ino) {
-            inode.lookups = inode.lookups.saturating_sub(nlookup);
-            if inode.lookups == 0 {
-                let fid = inode.fid;
-                self.inodes.remove(&ino);
-                self.clunk(fid);
-            }
+        if ino != ROOT_INO {
+            self.forget_lookups(ino, nlookup);
         }
     }
 
@@ -275,9 +267,9 @@ impl Filesystem for Fuse9p {
             Ok((open_fid, entry))
         });
         let (open_fid, (fid, attr)) = or_reply!(reply, created);
-        let attr = self.add_entry(fid, &attr);
+        let (attr, generation) = self.add_entry(parent, &name, fid, &attr);
         let fh = self.insert_handle(open_fid, attr.ino, pipelined);
-        reply.created(&self.tuning.entry_ttl, &attr, 0, fh, 0);
+        reply.created(&self.tuning.entry_ttl, &attr, generation, fh, 0);
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -330,26 +322,48 @@ impl Filesystem for Fuse9p {
         let entries = or_reply!(reply, self.rt.block_on(entries));
         // The sizes must include writes we have acknowledged but not sent yet.
         self.settle_writes(None);
-        let walks = entries
-            .iter()
-            .map(|e| walk_attr(&self.client, dir_fid, &e.name));
+        let client = &self.client;
+        let walks = entries.iter().map(|e| async move {
+            if is_dot(&e.name) {
+                None
+            } else {
+                walk_attr(client, dir_fid, &e.name).await
+            }
+        });
         let found = self.rt.block_on(futures_util::future::join_all(walks));
 
         let mut full = false;
+        let ttl = self.tuning.entry_ttl;
         for (e, found) in entries.iter().zip(found) {
+            // `add` is true once the buffer is full; the kernel only takes a lookup reference to
+            // entries that fit. From "." and ".." it takes only the inode number and type, so
+            // they aren't walked.
+            if is_dot(&e.name) {
+                let ino = self.ino(&e.qid);
+                let attr = dirent_attr(ino, kind_from_qid(e.qid.typ));
+                full = full || reply.add(ino, e.offset.cast_signed(), &e.name, &ttl, &attr, 0);
+                continue;
+            }
             let Some((fid, attr)) = found else {
                 continue;
             };
-            let ino = self.ino(&attr.qid);
-            let attr = to_fileattr(ino, &attr);
-            let ttl = self.tuning.entry_ttl;
-            // `add` is true once the buffer is full; the kernel only takes a lookup reference to
-            // entries that fit.
-            full = full || reply.add(ino, e.offset.cast_signed(), &e.name, &ttl, &attr, 0);
             if full {
                 self.clunk(fid);
-            } else {
-                self.add_lookup(ino, fid);
+                continue;
+            }
+            let entry_ino = self.ino(&attr.qid);
+            let generation = self.add_lookup(ino, &e.name, &attr.qid, fid);
+            let attr = to_fileattr(entry_ino, &attr);
+            full = reply.add(
+                entry_ino,
+                e.offset.cast_signed(),
+                &e.name,
+                &ttl,
+                &attr,
+                generation,
+            );
+            if full {
+                self.forget_lookups(entry_ino, 1);
             }
         }
         reply.ok();
@@ -383,7 +397,7 @@ impl Filesystem for Fuse9p {
             .client
             .mkdir(parent_fid, &name, mode & 0o7777, req.gid());
         or_reply!(reply, self.rt.block_on(made));
-        self.reply_new_entry(parent_fid, &name, reply);
+        self.reply_new_entry(parent, parent_fid, &name, reply);
     }
 
     fn symlink(
@@ -399,7 +413,7 @@ impl Filesystem for Fuse9p {
         let target = target.to_string_lossy();
         let made = self.client.symlink(parent_fid, &name, &target, req.gid());
         or_reply!(reply, self.rt.block_on(made));
-        self.reply_new_entry(parent_fid, &name, reply);
+        self.reply_new_entry(parent, parent_fid, &name, reply);
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
@@ -433,13 +447,16 @@ impl Filesystem for Fuse9p {
         or_reply!(reply, self.rt.block_on(renamed));
 
         // diod ties a fid to a path, so the moved file's fid now fails with ENOENT, and the kernel
-        // goes on using the inode without looking it up again. Give it a fid at the new path.
+        // goes on using the inode without looking it up again. Give it a fid at the new path, and
+        // the files under a moved directory too.
         if let Ok((fresh, qids)) = self.walk(to, &[&newname]) {
-            let ino = qids.last().map(|qid| self.ino(qid));
-            match ino.and_then(|ino| self.inodes.get_mut(&ino)) {
-                Some(inode) => {
-                    let stale = std::mem::replace(&mut inode.fid, fresh);
-                    self.clunk(stale);
+            match qids.last() {
+                Some(qid) => {
+                    let ino = self.ino(qid);
+                    self.replace_fid(ino, fresh, newparent, &newname);
+                    if is_dir(qid) {
+                        self.rewalk_descendants(ino);
+                    }
                 }
                 None => self.clunk(fresh),
             }
@@ -456,18 +473,18 @@ impl Filesystem for Fuse9p {
 }
 
 impl Fuse9p {
-    /// Record an entry the kernel now holds a lookup reference to, reached through `fid`.
-    fn add_entry(&mut self, fid: u32, attr: &Attr) -> FileAttr {
-        let ino = self.ino(&attr.qid);
-        self.add_lookup(ino, fid);
-        to_fileattr(ino, attr)
+    /// Record an entry the kernel now holds a lookup reference to, reached through `fid` as `name`
+    /// in directory `parent`: its attributes and the generation to report with them.
+    fn add_entry(&mut self, parent: u64, name: &str, fid: u32, attr: &Attr) -> (FileAttr, u64) {
+        let generation = self.add_lookup(parent, name, &attr.qid, fid);
+        (to_fileattr(self.ino(&attr.qid), attr), generation)
     }
 
-    /// Answer a mkdir or symlink with the entry it just made.
-    fn reply_new_entry(&mut self, parent_fid: u32, name: &str, reply: ReplyEntry) {
+    /// Answer a mkdir or symlink with the entry it just made in `parent`.
+    fn reply_new_entry(&mut self, parent: u64, parent_fid: u32, name: &str, reply: ReplyEntry) {
         let (fid, attr) = or_reply!(reply, self.walk_attr(parent_fid, name));
-        let attr = self.add_entry(fid, &attr);
-        reply.entry(&self.tuning.entry_ttl, &attr, 0);
+        let (attr, generation) = self.add_entry(parent, name, fid, &attr);
+        reply.entry(&self.tuning.entry_ttl, &attr, generation);
     }
 
     fn remove(&mut self, parent: u64, name: &OsStr, flags: u32, reply: ReplyEmpty) {
@@ -479,12 +496,15 @@ impl Fuse9p {
     }
 }
 
-/// Walk a new fid to entry `name` of `dir` ("." is `dir` itself) and get its attributes.
+/// Whether a directory entry is "." or "..".
+fn is_dot(name: &str) -> bool {
+    name == "." || name == ".."
+}
+
+/// Walk a new fid to entry `name` of `dir` and get its attributes.
 async fn walk_attr(client: &NineClient, dir: u32, name: &str) -> Option<(u32, Attr)> {
     let fid = client.alloc_fid();
-    let one = [name];
-    let names: &[&str] = if name == "." { &[] } else { &one };
-    client.walk(dir, fid, names).await.ok()?;
+    client.walk(dir, fid, &[name]).await.ok()?;
     match client.getattr(fid).await {
         Ok(attr) => Some((fid, attr)),
         Err(_) => {
