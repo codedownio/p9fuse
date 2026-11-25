@@ -146,13 +146,15 @@ impl Fuse9p {
     /// Count a lookup reference the kernel now holds to `ino`, reached through `fid` as `name` in
     /// directory `parent`, and return the generation to report with it.
     ///
-    /// A known inode keeps the fid it has while that still names the same file: by the same path,
-    /// or (asking the server) by another name of a hard-linked file. Otherwise the file was moved or
+    /// A known inode takes `fid` when it was found by the path its own fid was walked by: diod ties
+    /// a fid to the whole path, so a rename above the file has left that one naming nothing, and the
+    /// new fid is as good otherwise. Found by another path, the inode keeps its fid while that still
+    /// names the same file, as with a hard link (asking the server); if not, the file was moved or
     /// deleted outside the mount and `fid` takes over. A deleted file's number may already be this
-    /// new file's, which the kernel can't tell from the file it holds unless the generation changes.
-    /// They can only be the same file if we have it open, since the server's open descriptor then
-    /// keeps the number from being reused; a file moved outside the mount while not open gets a new
-    /// generation too, which only costs the kernel its caches for it.
+    /// new file's, which the kernel can't tell from the file it holds unless the generation
+    /// changes. They can only be the same file if we have it open, since the server's open
+    /// descriptor then keeps the number from being reused; a file moved outside the mount while
+    /// not open gets a new generation too, which only costs the kernel its caches for it.
     ///
     /// Not told apart: a file replaced at the same path by one of the same type with the same number
     /// (diod reports no generation of its own; the kernel sees the attributes change), and a
@@ -173,13 +175,19 @@ impl Fuse9p {
         let (old_fid, mut generation) = (inode.fid, inode.generation);
         let same_path = inode.parent == parent && *inode.name == *name;
         // The root keeps its attach fid, which the invalidator walks from.
-        if ino == ROOT_INO || same_path || self.names(old_fid, ino) {
+        if ino == ROOT_INO {
             self.clunk(fid);
             return generation;
         }
-        if !self.handles.values().any(|h| h.ino == ino) {
-            generation += 1;
-            self.inodes.get_mut(&ino).expect("checked above").generation = generation;
+        if !same_path {
+            if self.names(old_fid, ino) {
+                self.clunk(fid);
+                return generation;
+            }
+            if !self.handles.values().any(|h| h.ino == ino) {
+                generation += 1;
+                self.inodes.get_mut(&ino).expect("checked above").generation = generation;
+            }
         }
         self.replace_fid(ino, fid, parent, name);
         generation

@@ -798,6 +798,30 @@ async fn moved_open_file_keeps_its_inode() {
     .await;
 }
 
+/// A directory renamed from outside the mount leaves the fids of the files under it naming the old
+/// path, as diod ties a fid to its whole path. Looking a file up again by its own name in the moved
+/// directory must give it a working fid. (Entry TTL 0, so that every access looks up again.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_usable_after_external_directory_rename() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP child_usable_after_external_directory_rename: {reason}");
+        return;
+    }
+    let tuning = Tuning {
+        entry_ttl: Duration::ZERO,
+        ..Tuning::default()
+    };
+    with_mount_full(Via::Tcp, tuning, |m| {
+        std::fs::create_dir(m.mp.join("a")).unwrap();
+        std::fs::write(m.mp.join("a/child"), b"c").unwrap();
+        assert_eq!(std::fs::read(m.mp.join("a/child")).unwrap(), b"c");
+
+        std::fs::rename(m.export.join("a"), m.export.join("b")).unwrap();
+        assert_eq!(std::fs::read(m.mp.join("b/child")).unwrap(), b"c");
+    })
+    .await;
+}
+
 /// With READDIRPLUS, listing a directory returns its ".." entry, which must not become the parent's
 /// fid: diod resolves fids by path, so "child/.." stops working once the child is removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
