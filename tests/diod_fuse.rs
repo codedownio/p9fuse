@@ -715,6 +715,52 @@ async fn new_directory_reusing_overwritten_inode() {
     .await;
 }
 
+/// The freed inode number can also go to a file of the same type as the one the kernel holds. The
+/// kernel then only tells them apart by generation; without one it would serve the new file under
+/// the old name until the entry expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_file_reusing_overwritten_inode() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP new_file_reusing_overwritten_inode: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |m| {
+        let test = "new_file_reusing_overwritten_inode";
+        let create = |file: &Path| std::fs::write(file, b"other").unwrap();
+        let Some((doc, other)) = reuse_inode(&m, test, create) else {
+            return;
+        };
+
+        assert_eq!(std::fs::read(m.mp.join(&doc)).unwrap(), b"new");
+        assert_eq!(std::fs::read(m.mp.join(&other)).unwrap(), b"other");
+    })
+    .await;
+}
+
+/// A file moved from outside the mount while open through it is still the same file, so looking
+/// it up by its new name must not make the kernel drop the inode and fail the open descriptor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn moved_open_file_keeps_its_inode() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP moved_open_file_keeps_its_inode: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |m| {
+        std::fs::write(m.mp.join("a"), b"content").unwrap();
+        let mut open = std::fs::File::open(m.mp.join("a")).unwrap();
+        let ino = open.metadata().unwrap().ino();
+
+        std::fs::rename(m.export.join("a"), m.export.join("b")).unwrap();
+        assert_eq!(std::fs::read(m.mp.join("b")).unwrap(), b"content");
+        assert_eq!(std::fs::metadata(m.mp.join("b")).unwrap().ino(), ino);
+
+        let mut read = Vec::new();
+        std::io::Read::read_to_end(&mut open, &mut read).unwrap();
+        assert_eq!(read, b"content");
+    })
+    .await;
+}
+
 /// With READDIRPLUS, listing a directory returns its ".." entry, which must not become the parent's
 /// fid: diod resolves fids by path, so "child/.." stops working once the child is removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

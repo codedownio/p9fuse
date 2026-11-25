@@ -65,6 +65,13 @@ struct Inode {
     /// A fid walked to the file but not opened, used for getattr/setattr and to walk or open from.
     fid: u32,
     lookups: u64,
+    /// Where `fid` was walked to: the directory inode and the name in it. diod ties a fid to its
+    /// path, so this is what `fid` really names.
+    parent: u64,
+    name: Box<str>,
+    /// Told to the kernel with the inode number; changes when the number is found to have passed to
+    /// another file, so the kernel drops the inode it holds instead of merging the two files.
+    generation: u64,
 }
 
 struct FileHandle {
@@ -136,35 +143,78 @@ impl Fuse9p {
         }
     }
 
-    /// Count a lookup reference the kernel now holds to `ino`, which we reached through `fid`. A
-    /// known inode switches to `fid`: diod ties a fid to a path, and the one it had may name a
-    /// different file by now, since an inode number freed on the server can be given to a new file
-    /// before the kernel forgets the old one. (For a hard-linked file this means the fid follows the
-    /// name looked up last, and removing that name breaks the others until the entry TTL passes.)
-    /// The root keeps its attach fid, which the invalidator walks from.
-    fn add_lookup(&mut self, ino: u64, fid: u32) {
-        match self.inodes.get_mut(&ino) {
-            Some(inode) => {
-                inode.lookups += 1;
-                if ino == ROOT_INO {
-                    self.clunk(fid);
-                } else {
-                    self.replace_fid(ino, fid);
-                }
-            }
-            None => {
-                self.inodes.insert(ino, Inode { fid, lookups: 1 });
-            }
+    /// Count a lookup reference the kernel now holds to `ino`, reached through `fid` as `name` in
+    /// directory `parent`, and return the generation to report with it.
+    ///
+    /// A known inode keeps the fid it has while that still names the same file: by the same path,
+    /// or (asking the server) by another name of a hard-linked file. Otherwise the file was moved or
+    /// deleted outside the mount and `fid` takes over. A deleted file's number may already be this
+    /// new file's, which the kernel can't tell from the file it holds unless the generation changes.
+    /// They can only be the same file if we have it open, since the server's open descriptor then
+    /// keeps the number from being reused; a file moved outside the mount while not open gets a new
+    /// generation too, which only costs the kernel its caches for it.
+    ///
+    /// Not told apart: a file replaced at the same path by one of the same type with the same number
+    /// (diod reports no generation of its own; the kernel sees the attributes change), and a
+    /// hard-linked file's fid still breaks when the name it was walked by is removed.
+    fn add_lookup(&mut self, parent: u64, name: &str, ino: u64, fid: u32) -> u64 {
+        let Some(inode) = self.inodes.get_mut(&ino) else {
+            let inode = Inode {
+                fid,
+                lookups: 1,
+                parent,
+                name: name.into(),
+                generation: 0,
+            };
+            self.inodes.insert(ino, inode);
+            return 0;
+        };
+        inode.lookups += 1;
+        let (old_fid, mut generation) = (inode.fid, inode.generation);
+        let same_path = inode.parent == parent && *inode.name == *name;
+        // The root keeps its attach fid, which the invalidator walks from.
+        if ino == ROOT_INO || same_path || self.names(old_fid, ino) {
+            self.clunk(fid);
+            return generation;
         }
+        if !self.handles.values().any(|h| h.ino == ino) {
+            generation += 1;
+            self.inodes.get_mut(&ino).expect("checked above").generation = generation;
+        }
+        self.replace_fid(ino, fid, parent, name);
+        generation
     }
 
-    /// Make `fid` the fid of `ino` and release the one it had. `fid` is released instead if the
-    /// kernel doesn't hold `ino`.
-    fn replace_fid(&mut self, ino: u64, fid: u32) {
+    /// Whether `fid` still names the file with inode number `ino`.
+    fn names(&self, fid: u32, ino: u64) -> bool {
+        self.rt
+            .block_on(self.client.getattr(fid))
+            .is_ok_and(|attr| self.ino(&attr.qid) == ino)
+    }
+
+    /// Make `fid`, walked to `name` in directory `parent`, the fid of `ino` and release the one it
+    /// had. `fid` is released instead if the kernel doesn't hold `ino`.
+    fn replace_fid(&mut self, ino: u64, fid: u32, parent: u64, name: &str) {
         let stale = match self.inodes.get_mut(&ino) {
-            Some(inode) => std::mem::replace(&mut inode.fid, fid),
+            Some(inode) => {
+                inode.parent = parent;
+                inode.name = name.into();
+                std::mem::replace(&mut inode.fid, fid)
+            }
             None => fid,
         };
         self.clunk(stale);
+    }
+
+    /// Drop `n` of the kernel's lookup references to `ino`, releasing its fid once none are left.
+    fn forget_lookups(&mut self, ino: u64, n: u64) {
+        if let Some(inode) = self.inodes.get_mut(&ino) {
+            inode.lookups = inode.lookups.saturating_sub(n);
+            if inode.lookups == 0 {
+                let fid = inode.fid;
+                self.inodes.remove(&ino);
+                self.clunk(fid);
+            }
+        }
     }
 }

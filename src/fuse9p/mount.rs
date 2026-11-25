@@ -53,6 +53,9 @@ impl Fuse9p {
         let root = Inode {
             fid: root_fid,
             lookups: 1,
+            parent: ROOT_INO,
+            name: "".into(),
+            generation: 0,
         };
         let fs = Fuse9p {
             client,

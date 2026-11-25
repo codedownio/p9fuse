@@ -52,8 +52,8 @@ impl Filesystem for Fuse9p {
         });
         match (found, self.tuning.negative_ttl) {
             (Ok((fid, attr)), _) => {
-                let attr = self.add_entry(fid, &attr);
-                reply.entry(&self.tuning.entry_ttl, &attr, 0);
+                let (attr, generation) = self.add_entry(parent, &name, fid, &attr);
+                reply.entry(&self.tuning.entry_ttl, &attr, generation);
             }
             (Err(libc::ENOENT), Some(ttl)) => reply.entry(&ttl, &negative_attr(), 0),
             (Err(e), _) => reply.error(e),
@@ -61,16 +61,8 @@ impl Filesystem for Fuse9p {
     }
 
     fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
-        if ino == ROOT_INO {
-            return;
-        }
-        if let Some(inode) = self.inodes.get_mut(&ino) {
-            inode.lookups = inode.lookups.saturating_sub(nlookup);
-            if inode.lookups == 0 {
-                let fid = inode.fid;
-                self.inodes.remove(&ino);
-                self.clunk(fid);
-            }
+        if ino != ROOT_INO {
+            self.forget_lookups(ino, nlookup);
         }
     }
 
@@ -275,9 +267,9 @@ impl Filesystem for Fuse9p {
             Ok((open_fid, entry))
         });
         let (open_fid, (fid, attr)) = or_reply!(reply, created);
-        let attr = self.add_entry(fid, &attr);
+        let (attr, generation) = self.add_entry(parent, &name, fid, &attr);
         let fh = self.insert_handle(open_fid, attr.ino, pipelined);
-        reply.created(&self.tuning.entry_ttl, &attr, 0, fh, 0);
+        reply.created(&self.tuning.entry_ttl, &attr, generation, fh, 0);
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
@@ -355,13 +347,23 @@ impl Filesystem for Fuse9p {
             let Some((fid, attr)) = found else {
                 continue;
             };
-            let ino = self.ino(&attr.qid);
-            let attr = to_fileattr(ino, &attr);
-            full = full || reply.add(ino, e.offset.cast_signed(), &e.name, &ttl, &attr, 0);
             if full {
                 self.clunk(fid);
-            } else {
-                self.add_lookup(ino, fid);
+                continue;
+            }
+            let entry_ino = self.ino(&attr.qid);
+            let attr = to_fileattr(entry_ino, &attr);
+            let generation = self.add_lookup(ino, &e.name, entry_ino, fid);
+            full = reply.add(
+                entry_ino,
+                e.offset.cast_signed(),
+                &e.name,
+                &ttl,
+                &attr,
+                generation,
+            );
+            if full {
+                self.forget_lookups(entry_ino, 1);
             }
         }
         reply.ok();
@@ -395,7 +397,7 @@ impl Filesystem for Fuse9p {
             .client
             .mkdir(parent_fid, &name, mode & 0o7777, req.gid());
         or_reply!(reply, self.rt.block_on(made));
-        self.reply_new_entry(parent_fid, &name, reply);
+        self.reply_new_entry(parent, parent_fid, &name, reply);
     }
 
     fn symlink(
@@ -411,7 +413,7 @@ impl Filesystem for Fuse9p {
         let target = target.to_string_lossy();
         let made = self.client.symlink(parent_fid, &name, &target, req.gid());
         or_reply!(reply, self.rt.block_on(made));
-        self.reply_new_entry(parent_fid, &name, reply);
+        self.reply_new_entry(parent, parent_fid, &name, reply);
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
@@ -448,7 +450,7 @@ impl Filesystem for Fuse9p {
         // goes on using the inode without looking it up again. Give it a fid at the new path.
         if let Ok((fresh, qids)) = self.walk(to, &[&newname]) {
             match qids.last().map(|qid| self.ino(qid)) {
-                Some(ino) => self.replace_fid(ino, fresh),
+                Some(ino) => self.replace_fid(ino, fresh, newparent, &newname),
                 None => self.clunk(fresh),
             }
         }
@@ -464,18 +466,19 @@ impl Filesystem for Fuse9p {
 }
 
 impl Fuse9p {
-    /// Record an entry the kernel now holds a lookup reference to, reached through `fid`.
-    fn add_entry(&mut self, fid: u32, attr: &Attr) -> FileAttr {
+    /// Record an entry the kernel now holds a lookup reference to, reached through `fid` as `name`
+    /// in directory `parent`: its attributes and the generation to report with them.
+    fn add_entry(&mut self, parent: u64, name: &str, fid: u32, attr: &Attr) -> (FileAttr, u64) {
         let ino = self.ino(&attr.qid);
-        self.add_lookup(ino, fid);
-        to_fileattr(ino, attr)
+        let generation = self.add_lookup(parent, name, ino, fid);
+        (to_fileattr(ino, attr), generation)
     }
 
-    /// Answer a mkdir or symlink with the entry it just made.
-    fn reply_new_entry(&mut self, parent_fid: u32, name: &str, reply: ReplyEntry) {
+    /// Answer a mkdir or symlink with the entry it just made in `parent`.
+    fn reply_new_entry(&mut self, parent: u64, parent_fid: u32, name: &str, reply: ReplyEntry) {
         let (fid, attr) = or_reply!(reply, self.walk_attr(parent_fid, name));
-        let attr = self.add_entry(fid, &attr);
-        reply.entry(&self.tuning.entry_ttl, &attr, 0);
+        let (attr, generation) = self.add_entry(parent, name, fid, &attr);
+        reply.entry(&self.tuning.entry_ttl, &attr, generation);
     }
 
     fn remove(&mut self, parent: u64, name: &OsStr, flags: u32, reply: ReplyEmpty) {
