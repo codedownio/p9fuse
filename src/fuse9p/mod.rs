@@ -224,24 +224,61 @@ impl Fuse9p {
     }
 
     /// Walk the fids of the inodes held under directory `dir` again, from their parents' fids: the
-    /// directory moved, so the paths diod tied them to name nothing now.
+    /// directory moved, so the paths diod tied them to name nothing now. One pass over the inode
+    /// table finds each directory's children; then each level of the tree is walked in batches of
+    /// concurrent requests, so the FUSE thread blocks for a few round trips per level rather than
+    /// one per file. (The batch keeps well clear of the 16-bit tag space, and of many thousands of
+    /// requests in flight at once, which the server answers disproportionately slowly.)
     fn rewalk_descendants(&mut self, dir: u64) {
-        let mut dirs = vec![dir];
-        while let Some(dir) = dirs.pop() {
-            let Ok(dir_fid) = self.fid_of(dir) else {
-                continue;
-            };
-            let children: Vec<(u64, Box<str>)> = self
-                .inodes
-                .iter()
-                .filter(|(&ino, inode)| inode.parent == dir && ino != ROOT_INO)
-                .map(|(&ino, inode)| (ino, inode.name.clone()))
-                .collect();
-            for (child, name) in children {
-                if let Ok((fresh, _)) = self.walk(dir_fid, &[&name]) {
-                    self.replace_fid(child, fresh, dir, &name);
+        const BATCH: usize = 512;
+        let mut children: HashMap<u64, Vec<(u64, Box<str>)>> = HashMap::new();
+        for (&ino, inode) in &self.inodes {
+            if ino != ROOT_INO {
+                children
+                    .entry(inode.parent)
+                    .or_default()
+                    .push((ino, inode.name.clone()));
+            }
+        }
+        let Ok(dir_fid) = self.fid_of(dir) else {
+            return;
+        };
+        let mut level = vec![(dir, dir_fid)];
+        while !level.is_empty() {
+            let mut todo = Vec::new();
+            for (parent, parent_fid) in level {
+                for (ino, name) in children.remove(&parent).unwrap_or_default() {
+                    todo.push((parent, parent_fid, ino, name));
                 }
-                dirs.push(child);
+            }
+            level = Vec::new();
+            for batch in todo.chunks(BATCH) {
+                let client = &self.client;
+                let walks = batch.iter().map(|(_, parent_fid, _, name)| async move {
+                    let fid = client.alloc_fid();
+                    let qids = client.walk(*parent_fid, fid, &[name]).await.ok()?;
+                    Some((fid, qids))
+                });
+                let walked = self.rt.block_on(futures_util::future::join_all(walks));
+
+                let mut stale = Vec::new();
+                for ((parent, _, ino, name), walked) in batch.iter().zip(walked) {
+                    let Some((fid, qids)) = walked else {
+                        continue;
+                    };
+                    if let Some(inode) = self.inodes.get_mut(ino) {
+                        inode.parent = *parent;
+                        inode.name = name.clone();
+                        stale.push(std::mem::replace(&mut inode.fid, fid));
+                    } else {
+                        stale.push(fid);
+                    }
+                    if qids.last().is_some_and(is_dir) {
+                        level.push((*ino, fid));
+                    }
+                }
+                let clunks = stale.into_iter().map(|fid| self.client.clunk(fid));
+                let _ = self.rt.block_on(futures_util::future::join_all(clunks));
             }
         }
     }
