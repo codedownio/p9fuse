@@ -25,7 +25,7 @@ pub use tuning::Tuning;
 
 use crate::client::NineClient;
 use crate::ninep::{Attr, Qid};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -50,6 +50,9 @@ pub struct Fuse9p {
     tuning: Tuning,
     /// Inodes the kernel holds lookup references to.
     inodes: HashMap<u64, Inode>,
+    /// The inodes in `inodes` whose `parent` is each directory, so that a renamed directory's
+    /// descendants are found in time proportional to their number.
+    children: HashMap<u64, HashSet<u64>>,
     /// The export root's qid path, which is FUSE inode 1 rather than itself. See `qid_to_ino`.
     root_qid_path: u64,
     /// Open files and directories, by FUSE handle number.
@@ -178,6 +181,7 @@ impl Fuse9p {
                 generation: 0,
             };
             self.inodes.insert(ino, inode);
+            self.children.entry(parent).or_default().insert(ino);
             return 0;
         };
         inode.lookups += 1;
@@ -214,32 +218,38 @@ impl Fuse9p {
     fn replace_fid(&mut self, ino: u64, fid: u32, parent: u64, name: &str) {
         let stale = match self.inodes.get_mut(&ino) {
             Some(inode) => {
-                inode.parent = parent;
+                let old_parent = std::mem::replace(&mut inode.parent, parent);
                 inode.name = name.into();
-                std::mem::replace(&mut inode.fid, fid)
+                let stale = std::mem::replace(&mut inode.fid, fid);
+                if old_parent != parent {
+                    self.unlink_child(old_parent, ino);
+                    self.children.entry(parent).or_default().insert(ino);
+                }
+                stale
             }
             None => fid,
         };
         self.clunk(stale);
     }
 
-    /// Walk the fids of the inodes held under directory `dir` again, from their parents' fids: the
-    /// directory moved, so the paths diod tied them to name nothing now. One pass over the inode
-    /// table finds each directory's children; then each level of the tree is walked in batches of
-    /// concurrent requests, so the FUSE thread blocks for a few round trips per level rather than
-    /// one per file. (The batch keeps well clear of the 16-bit tag space, and of many thousands of
-    /// requests in flight at once, which the server answers disproportionately slowly.)
-    fn rewalk_descendants(&mut self, dir: u64) {
-        const BATCH: usize = 512;
-        let mut children: HashMap<u64, Vec<(u64, Box<str>)>> = HashMap::new();
-        for (&ino, inode) in &self.inodes {
-            if ino != ROOT_INO {
-                children
-                    .entry(inode.parent)
-                    .or_default()
-                    .push((ino, inode.name.clone()));
+    /// Take `ino` out of `parent`'s children.
+    fn unlink_child(&mut self, parent: u64, ino: u64) {
+        if let Some(set) = self.children.get_mut(&parent) {
+            set.remove(&ino);
+            if set.is_empty() {
+                self.children.remove(&parent);
             }
         }
+    }
+
+    /// Walk the fids of the inodes held under directory `dir` again, from their parents' fids: the
+    /// directory moved, so the paths diod tied them to name nothing now. Each level of the tree is
+    /// walked in batches of concurrent requests, so the FUSE thread blocks for a few round trips
+    /// per level rather than one per file. (The batch keeps well clear of the 16-bit tag space,
+    /// and of many thousands of requests in flight at once, which the server answers
+    /// disproportionately slowly.)
+    fn rewalk_descendants(&mut self, dir: u64) {
+        const BATCH: usize = 512;
         let Ok(dir_fid) = self.fid_of(dir) else {
             return;
         };
@@ -247,14 +257,16 @@ impl Fuse9p {
         while !level.is_empty() {
             let mut todo = Vec::new();
             for (parent, parent_fid) in level {
-                for (ino, name) in children.remove(&parent).unwrap_or_default() {
-                    todo.push((parent, parent_fid, ino, name));
+                for &ino in self.children.get(&parent).into_iter().flatten() {
+                    if let Some(inode) = self.inodes.get(&ino) {
+                        todo.push((parent_fid, ino, inode.name.clone()));
+                    }
                 }
             }
             level = Vec::new();
             for batch in todo.chunks(BATCH) {
                 let client = &self.client;
-                let walks = batch.iter().map(|(_, parent_fid, _, name)| async move {
+                let walks = batch.iter().map(|(parent_fid, _, name)| async move {
                     let fid = client.alloc_fid();
                     let qids = client.walk(*parent_fid, fid, &[name]).await.ok()?;
                     Some((fid, qids))
@@ -262,17 +274,15 @@ impl Fuse9p {
                 let walked = self.rt.block_on(futures_util::future::join_all(walks));
 
                 let mut stale = Vec::new();
-                for ((parent, _, ino, name), walked) in batch.iter().zip(walked) {
+                for ((_, ino, _), walked) in batch.iter().zip(walked) {
                     let Some((fid, qids)) = walked else {
                         continue;
                     };
-                    if let Some(inode) = self.inodes.get_mut(ino) {
-                        inode.parent = *parent;
-                        inode.name = name.clone();
-                        stale.push(std::mem::replace(&mut inode.fid, fid));
-                    } else {
+                    let Some(inode) = self.inodes.get_mut(ino) else {
                         stale.push(fid);
-                    }
+                        continue;
+                    };
+                    stale.push(std::mem::replace(&mut inode.fid, fid));
                     if qids.last().is_some_and(is_dir) {
                         level.push((*ino, fid));
                     }
@@ -288,8 +298,9 @@ impl Fuse9p {
         if let Some(inode) = self.inodes.get_mut(&ino) {
             inode.lookups = inode.lookups.saturating_sub(n);
             if inode.lookups == 0 {
-                let fid = inode.fid;
+                let (fid, parent) = (inode.fid, inode.parent);
                 self.inodes.remove(&ino);
+                self.unlink_child(parent, ino);
                 self.clunk(fid);
             }
         }

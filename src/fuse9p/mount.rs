@@ -62,6 +62,7 @@ impl Fuse9p {
             rt: Handle::current(),
             tuning,
             inodes: HashMap::from([(ROOT_INO, root)]),
+            children: HashMap::new(),
             root_qid_path: root_qid.path,
             handles: HashMap::new(),
             open_handles,
