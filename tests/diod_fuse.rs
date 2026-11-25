@@ -822,6 +822,53 @@ async fn child_usable_after_external_directory_rename() {
     .await;
 }
 
+/// A process's working directory is held by the kernel without a FUSE handle. When that directory
+/// is renamed from outside the mount and then looked up by its new name, it must stay the same inode
+/// for the kernel, or the process gets EIO for everything it does there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cwd_survives_external_directory_rename() {
+    if let Some(reason) = skip_reason() {
+        eprintln!("SKIP cwd_survives_external_directory_rename: {reason}");
+        return;
+    }
+    with_mount_full(Via::Tcp, Tuning::default(), |m| {
+        std::fs::create_dir(m.mp.join("d")).unwrap();
+        // The shell reports its cwd's inode once inside, and lists it when told to go on.
+        let script = format!(
+            "cd {} && stat -c %i . && read go && ls && echo listed",
+            m.mp.join("d").display()
+        );
+        let mut sh = Command::new("sh")
+            .args(["-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(sh.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(
+            line.trim(),
+            std::fs::metadata(m.export.join("d"))
+                .unwrap()
+                .ino()
+                .to_string()
+        );
+
+        std::fs::rename(m.export.join("d"), m.export.join("e")).unwrap();
+        std::fs::metadata(m.mp.join("e")).unwrap();
+        sh.stdin.take().unwrap().write_all(b"go\n").unwrap();
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut rest).unwrap();
+        assert!(
+            sh.wait().unwrap().success(),
+            "shell failed in its renamed cwd"
+        );
+        assert_eq!(rest.trim(), "listed");
+    })
+    .await;
+}
+
 /// With READDIRPLUS, listing a directory returns its ".." entry, which must not become the parent's
 /// fid: diod resolves fids by path, so "child/.." stops working once the child is removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

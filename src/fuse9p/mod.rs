@@ -92,6 +92,10 @@ fn qid_to_ino(qid_path: u64, root_qid_path: u64) -> u64 {
     }
 }
 
+fn is_dir(qid: &Qid) -> bool {
+    qid.typ & 0x80 != 0
+}
+
 impl Fuse9p {
     fn ino(&self, qid: &Qid) -> u64 {
         qid_to_ino(qid.path, self.root_qid_path)
@@ -154,12 +158,17 @@ impl Fuse9p {
     /// new file's, which the kernel can't tell from the file it holds unless the generation
     /// changes. They can only be the same file if we have it open, since the server's open
     /// descriptor then keeps the number from being reused; a file moved outside the mount while
-    /// not open gets a new generation too, which only costs the kernel its caches for it.
+    /// not open gets a new generation too, which only costs the kernel its caches for it. A
+    /// directory keeps its generation: the kernel caches no data for one, so merging two is only a
+    /// stale listing until the entry expires, while a new generation fails every process whose
+    /// working directory is inside with EIO, and a directory renamed outside the mount is the
+    /// likelier case.
     ///
     /// Not told apart: a file replaced at the same path by one of the same type with the same number
     /// (diod reports no generation of its own; the kernel sees the attributes change), and a
     /// hard-linked file's fid still breaks when the name it was walked by is removed.
-    fn add_lookup(&mut self, parent: u64, name: &str, ino: u64, fid: u32) -> u64 {
+    fn add_lookup(&mut self, parent: u64, name: &str, qid: &Qid, fid: u32) -> u64 {
+        let ino = self.ino(qid);
         let Some(inode) = self.inodes.get_mut(&ino) else {
             let inode = Inode {
                 fid,
@@ -184,7 +193,7 @@ impl Fuse9p {
                 self.clunk(fid);
                 return generation;
             }
-            if !self.handles.values().any(|h| h.ino == ino) {
+            if !is_dir(qid) && !self.handles.values().any(|h| h.ino == ino) {
                 generation += 1;
                 self.inodes.get_mut(&ino).expect("checked above").generation = generation;
             }

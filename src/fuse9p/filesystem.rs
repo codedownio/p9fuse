@@ -352,8 +352,8 @@ impl Filesystem for Fuse9p {
                 continue;
             }
             let entry_ino = self.ino(&attr.qid);
+            let generation = self.add_lookup(ino, &e.name, &attr.qid, fid);
             let attr = to_fileattr(entry_ino, &attr);
-            let generation = self.add_lookup(ino, &e.name, entry_ino, fid);
             full = reply.add(
                 entry_ino,
                 e.offset.cast_signed(),
@@ -469,9 +469,8 @@ impl Fuse9p {
     /// Record an entry the kernel now holds a lookup reference to, reached through `fid` as `name`
     /// in directory `parent`: its attributes and the generation to report with them.
     fn add_entry(&mut self, parent: u64, name: &str, fid: u32, attr: &Attr) -> (FileAttr, u64) {
-        let ino = self.ino(&attr.qid);
-        let generation = self.add_lookup(parent, name, ino, fid);
-        (to_fileattr(ino, attr), generation)
+        let generation = self.add_lookup(parent, name, &attr.qid, fid);
+        (to_fileattr(self.ino(&attr.qid), attr), generation)
     }
 
     /// Answer a mkdir or symlink with the entry it just made in `parent`.
